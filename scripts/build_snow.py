@@ -145,10 +145,36 @@ def to_image(depth_m: np.ndarray) -> Image.Image:
     cm = depth_m * 100.0
     edge = np.clip((cm - 0.5) / 1.0, 0.0, 1.0)
     alpha = edge * (0.5 + np.clip(cm / 30.0, 0.0, 1.0) * 0.42)
-    rgba = np.empty(depth_m.shape + (4,), dtype=np.uint8)
-    rgba[..., :3] = 255
-    rgba[..., 3] = np.round(alpha * 255).astype(np.uint8)
-    return Image.fromarray(rgba, "RGBA")
+    # One byte per pixel: a white palette whose entries only differ in opacity.
+    # Opacity is rounded to steps of 4 so the file compresses well.
+    index = (np.round(alpha * 255 / 4) * 4).clip(0, 255).astype(np.uint8)
+    image = Image.fromarray(index, "P")
+    image.putpalette([255] * 768)
+    image.info["transparency"] = bytes(range(256))
+    return image
+
+
+def ascii_map(image: Image.Image, columns: int = 96, rows: int = 40) -> str:
+    """Coarse text rendering for the build log, to eyeball that geography is right."""
+    alpha = np.asarray(image, dtype=np.float32) / 255.0
+    size = alpha.shape[0]
+    cells = alpha[: size - size % rows, : size - size % columns]
+    cells = cells.reshape(rows, cells.shape[0] // rows, columns, cells.shape[1] // columns).mean(axis=(1, 3))
+    shades = " .:*#"
+    return "\n".join("".join(shades[min(4, int(v * 5 / 0.92))] for v in line) for line in cells)
+
+
+CHECKPOINTS = [  # (name, lat, lon) – printed in the log as a sanity check
+    ("Grønland, innlandsisen", 72.6, -38.5), ("Tromsø", 69.65, 18.96), ("Oslo", 59.91, 10.75),
+    ("Sahara", 23.0, 10.0), ("Sydney", -33.87, 151.21), ("Sydpolplatået", -80.0, 0.0),
+    ("Jakutsk", 62.03, 129.73), ("Denver", 39.74, -104.99),
+]
+
+
+def print_checkpoints(depth: np.ndarray) -> None:
+    for name, lat, lon in CHECKPOINTS:
+        value = depth[round((90 - lat) / 0.25), round((lon % 360) / 0.25) % depth.shape[1]]
+        print(f"      {name:24s} {value * 100:6.1f} cm")
 
 
 PREVIEW = """<!doctype html>
@@ -193,7 +219,10 @@ def main() -> int:
         depth = decode(snow_depth_message(run, hour))
         image = to_image(to_mercator(depth))
         name = f"snow_{run_id}_d{d}.png"
-        image.save(snow_dir / name, optimize=True)
+        image.save(snow_dir / name, optimize=True, transparency=image.info["transparency"])
+        if d == 0:
+            print_checkpoints(depth)
+            print(ascii_map(image))
         print(f"    wrote {name}, {(snow_dir / name).stat().st_size / 1024:.0f} kB")
         days.append({"date": date.isoformat(), "file": name, "forecastHour": hour})
 
