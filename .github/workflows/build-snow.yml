@@ -32,7 +32,19 @@ jobs:
           python-version: "3.12"
           cache: pip
       - run: pip install -r requirements.txt
-      - run: python scripts/build_snow.py --out site
+      - name: Test snøsetninger
+        run: PYTHONPATH=scripts python -m unittest discover -s tests -v
+      # Nøkkelen er en Actions-hemmelighet og skal aldri skrives til loggen.
+      # Uten nøkkel, eller uten URL og modell, brukes bare regeltekst.
+      - name: Bygg snøkart
+        env:
+          SNOWMAP_AI_API_KEY: ${{ secrets.SNOWMAP_AI_API_KEY }}
+          SNOWMAP_AI_BASE_URL: ${{ vars.SNOWMAP_AI_BASE_URL }}
+          SNOWMAP_AI_MODEL: ${{ vars.SNOWMAP_AI_MODEL }}
+          SNOWMAP_AI_MAX_CALLS: ${{ vars.SNOWMAP_AI_MAX_CALLS }}
+          # Tom verdi: skriptet skriver app_config.live_ai_daily_cap = 5.
+          SNOWMAP_LIVE_AI_DAILY_CAP: ${{ vars.SNOWMAP_LIVE_AI_DAILY_CAP }}
+        run: python scripts/build_snow.py --out site
       - uses: actions/upload-pages-artifact@v3
         with:
           path: site

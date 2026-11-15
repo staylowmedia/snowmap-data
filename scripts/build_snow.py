@@ -5,7 +5,9 @@ For today and the next seven days this downloads the GFS 0.25° snow depth
 field (one small GRIB message per day, fetched by byte range from NOAA's
 public archive), reprojects it to Web Mercator and writes a transparent PNG
 where white means snow on the ground. A manifest (latest.json) tells the app
-which file belongs to which date.
+which file belongs to which date. The same grids also feed short snow
+sentences (ai_sentences.json); that step never changes the images or the
+manifest, and a failure there still leaves both in place.
 
 GFS data is produced by NOAA/NCEP and is in the public domain.
 """
@@ -190,7 +192,8 @@ PREVIEW = """<!doctype html>
 <main>
 <h1>Snowmap – snødata</h1>
 <p>Snødybde fra NOAA GFS 0,25°, kjøring {run} UTC. Laget {generated} UTC.
-Hvitt betyr snø på bakken. <a href="snow/latest.json">latest.json</a></p>
+Hvitt betyr snø på bakken. <a href="snow/latest.json">latest.json</a>.
+Korte snøsetninger til appen: <a href="snow/ai_sentences.json">ai_sentences.json</a>.</p>
 <div class="grid">{figures}</div>
 </main></html>
 """
@@ -213,10 +216,15 @@ def main() -> int:
     snow_dir.mkdir(parents=True, exist_ok=True)
 
     days = []
+    today_depth = None
+    later_depth = None
     for d, hour in enumerate(hours):
         date = first_day + dt.timedelta(days=d)
         print(f"  {date} (f{hour:03d})")
         depth = decode(snow_depth_message(run, hour))
+        if today_depth is None:
+            today_depth = depth
+        later_depth = depth
         image = to_image(to_mercator(depth))
         name = f"snow_{run_id}_d{d}.png"
         image.save(snow_dir / name, optimize=True, transparency=image.info["transparency"])
@@ -235,6 +243,22 @@ def main() -> int:
         "days": days,
     }
     (snow_dir / "latest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+
+    # Sentences are additive. A failure here must not throw away the images.
+    try:
+        import snow_sentences
+        snow_sentences.write_sentences(
+            snow_dir / "ai_sentences.json",
+            today_depth,
+            later_depth,
+            generated=manifest["generated"],
+            run=run_id,
+            first_date=days[0]["date"],
+            last_date=days[-1]["date"],
+        )
+    except Exception as error:  # noqa: BLE001
+        print(f"Snow sentences skipped ({type(error).__name__}). "
+              "Images and latest.json are ready.")
 
     figures = "".join(
         f'<figure><img src="snow/{day["file"]}" alt="Snø {day["date"]}">'
