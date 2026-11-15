@@ -129,8 +129,9 @@ class RuleAndValidationTest(unittest.TestCase):
         self.assertIsNone(snow.validate_sentence(
             "Around {place} and the wider region, see www.evil.example today.", "en"))
         for number in (
-            "555 0100", "555-0100", "555.0100", "55 50 10", "123 456 789",
-            "123-456-789", "1 800 555 010", "55501",
+            "555 0100", "555-0100", "555.0100", "555–0100", "555, 0100",
+            "55 50 10", "55 501", "123 456 789", "123-456-789",
+            "1 800 555 010", "12 345 678", "55501",
         ):
             self.assertIsNone(
                 snow.validate_sentence(
@@ -156,9 +157,11 @@ class RuleAndValidationTest(unittest.TestCase):
         self.assertIsNone(snow.validate_sentence(
             "Around {place} and the wider region, see example。com today.", "en"))
         for spoken in (
-            "example dot com", "example (dot) com", "example punkt com",
-            "example punktum com", "example point com", "example d0t com",
-            "exampledotcom", "example. com",
+            "example dot com", "example (dot) com", "example(dot)com",
+            "example dot  com", "example dot c o m", "example punkt com",
+            "example punktum com", "example punto com", "example ponto com",
+            "example point com", "example d0t com", "exampledotcom",
+            "example dotis", "example. com", ". com", "点com",
         ):
             self.assertIsNone(
                 snow.validate_sentence(
@@ -167,11 +170,18 @@ class RuleAndValidationTest(unittest.TestCase):
             )
         self.assertIsNotNone(snow.validate_sentence(
             "Around {place} and the wider region, the snow point is solid.", "en"))
+        self.assertIsNotNone(snow.validate_sentence(
+            "Around {place} and the wider region, the snow dot is patchy.", "en"))
         for line, lang in (
             ("{place}请访问snowdeals.com查看积雪。", "zh-Hans"),
             ("{place}周辺の広い地域ではsnowdeals.comを見てください。", "ja"),
             ("{place}请访问evil.ru查看积雪。", "zh-Hans"),
             ("{place}请看snowdeals。com了解积雪。", "zh-Hans"),
+            ("{place}附近有雪.no的预报。", "zh-Hans"),
+            ("{place}周边雪况见snowdeals.中国。", "zh-Hans"),
+            ("{place}这里的域名是example.xn--fiqs8s。", "zh-Hans"),
+            ("{place}附近雪况见snowdeals.cöm。", "zh-Hans"),
+            ("{place}附近有snøsalg.nö的雪。", "zh-Hans"),
         ):
             self.assertIsNone(snow.validate_sentence(line, lang), line)
         self.assertIsNone(snow.validate_sentence(
@@ -195,6 +205,22 @@ class RuleAndValidationTest(unittest.TestCase):
             "Around {place} and the wider region, about 2–4 cm of snow.", "en"))
         self.assertIsNotNone(snow.validate_sentence(
             "Around {place} and the wider region, about 1 234 567 cm of snow.", "en"))
+        self.assertIsNotNone(snow.validate_sentence(
+            "Around {place} and the wider region, about 2-4 cm of snow.", "en"))
+        self.assertIsNotNone(snow.validate_sentence(
+            "Around {place} and the wider region, about 10-20 cm of snow.", "en"))
+        self.assertIsNotNone(snow.validate_sentence(
+            "{place}周辺の広い地域では、雪は2〜4cmです。", "ja"))
+        self.assertIsNotNone(snow.validate_sentence(
+            "In der weiteren Region um {place} liegt am 22. November Schnee.", "de"))
+        self.assertIsNotNone(snow.validate_sentence(
+            "In der weiteren Region um {place} liegt der Gefrierpunkt.", "de"))
+        self.assertIsNotNone(snow.validate_sentence(
+            "Around {place} and the wider region, this is the high point.", "en"))
+        self.assertIsNotNone(snow.validate_sentence(
+            "Around {place} and the wider region, le point le plus haut.", "en"))
+        self.assertIsNotNone(snow.validate_sentence(
+            "Around {place} and the wider region, snow on 2026-11-15 is patchy.", "en"))
         almost = "{place}雪です。"
         self.assertEqual(snow._cjk_count(almost), 3)
         self.assertIsNone(snow.accept_sentence(almost, "ja", None))
@@ -207,7 +233,7 @@ class RuleAndValidationTest(unittest.TestCase):
     def test_every_rule_passes_for_every_depth(self):
         english_none = snow.SAFE_SENTENCE
         for kind in snow._RULES:
-            for number in (1, 5, 10, 12, 40, 100, 999):
+            for number in range(10000):
                 for lang in snow.LANGUAGES:
                     text = snow._RULES[kind][lang].replace("{n}", str(number))
                     english = None if lang == "en" else snow._RULES[kind]["en"].replace("{n}", str(number))
@@ -824,7 +850,19 @@ class BudgetTest(unittest.TestCase):
         self.assertNotIn("site", temporary.parts)
         self.assertTrue(snow._SCHEME_RE.search("tel:12"))
         self.assertEqual(snow._normalize_dots("snowdeals。com"), "snowdeals.com")
-        self.assertFalse(snow._valid_base("http://127.0.0.1:9/v1"))
+        self.assertFalse(snow._valid_base("http://127.0.0.1:9/v1", {}))
+        with mock.patch.dict(os.environ, {"SNOWMAP_AI_ALLOW_HTTP_LOCALHOST": "1"}):
+            self.assertFalse(snow.load_config({
+                "SNOWMAP_AI_API_KEY": "k",
+                "SNOWMAP_AI_BASE_URL": "http://127.0.0.1:9/v1",
+                "SNOWMAP_AI_MODEL": "demo",
+            }).enabled)
+        self.assertTrue(snow.load_config({
+            "SNOWMAP_AI_API_KEY": "k",
+            "SNOWMAP_AI_BASE_URL": "http://127.0.0.1:9/v1",
+            "SNOWMAP_AI_MODEL": "demo",
+            "SNOWMAP_AI_ALLOW_HTTP_LOCALHOST": "1",
+        }).enabled)
         with self.assertRaises(ValueError):
             snow.post_chat("http://127.0.0.1:9/v1/chat/completions", "k", "m", [], 1)
         config = snow.load_config({

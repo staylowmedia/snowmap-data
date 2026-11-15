@@ -72,8 +72,11 @@ SAFE_SENTENCE = "Around {place} and the wider region, there is little or no snow
 
 _MODEL_RE = re.compile(r"[A-Za-z0-9._:/-]{1,80}")
 # Underscore is excluded on purpose: \w would otherwise allow markdown _emphasis_.
-# En dash is allowed so "2–4 cm" is not rejected. Underscore stays out.
-_ALLOWED_FULL_RE = re.compile(r"(?:[^\W_]|[\s.,;:'’\"()%，、。！？\-\u2013])+$", re.UNICODE)
+# Hyphen, en dash, and the Japanese wave dash are allowed in ranges such as 2-4.
+_ALLOWED_FULL_RE = re.compile(
+    r"(?:[^\W_]|[\s.,;:'’\"()%，、。！？\-\u2013\u301C\uFF5E])+$",
+    re.UNICODE,
+)
 _TERMINATORS = set(".!?。！？")
 _SCHEME_RE = re.compile(r"(?i)(?:javascript|data|vbscript|mailto|https?|file|tel)\s*:|://")
 # ASCII-only edges. \w would treat CJK as a boundary and miss "雪snowdeals.com".
@@ -85,23 +88,29 @@ _DOMAIN_RE = re.compile(
     + r"(?:[A-Za-z0-9][A-Za-z0-9-]{0,61}[A-Za-z0-9]\.)+[A-Za-z]{2,}"
     + _NOT_ASCII_AFTER
 )
+# The keyword must be its own word, so "Gefrierpunkt" is not a domain.
+# "point" is only a separator before a real TLD; "punto"/"ponto" always are.
 _DOT_WORD_RE = re.compile(
     _NOT_ASCII_BEFORE
     + r"[A-Za-z0-9]{2,}(?:-[A-Za-z0-9]+)*"
-    + r"\s*(?:\(\s*)?(?:dot|d0t|punktum|punkt|point)(?:\s*\))?\s+"
-    + r"([A-Za-z]{2,})"
+    + r"(?:\s*\(\s*|\s+)"
+    + r"(dot|d0t|punktum|punkt|punto|ponto|point)"
+    + r"\s*\)?"
+    + r"\s*"
+    + r"((?:[A-Za-z]\s+){1,6}[A-Za-z]|[A-Za-z]{2,})"
     + _NOT_ASCII_AFTER,
     re.IGNORECASE,
 )
+_POINT_TLDS = frozenset({"com", "net", "org", "ru", "io"})
 _SPACED_DOT_RE = re.compile(
     _NOT_ASCII_BEFORE
     + r"[A-Za-z0-9][A-Za-z0-9-]{2,61}[A-Za-z0-9]\.\s+[A-Za-z]{2,}"
     + _NOT_ASCII_AFTER
 )
 _DOTCOM_RE = re.compile(_NOT_ASCII_BEFORE + r"[A-Za-z0-9]{2,}dotcom" + _NOT_ASCII_AFTER, re.IGNORECASE)
-_DOT_TLD_SKIP = frozenset({"is", "the", "of", "to", "an", "or", "cm", "mm", "and"})
 # Five digits in a row is a phone, not a snow depth we print. 55501 is rejected; 9999 cm is not.
 _PHONE_RUN_RE = re.compile(r"\d{5,}")
+_PHONE_CHUNK_RE = re.compile(r"\d+(?:(?:\s*[,.\-\u2013\u301C\uFF5E]\s*|\s+)\d+)+")
 _ABBREV_RE = re.compile(r"(?i)\b(?:ca|mr|mrs|dr|z\.b|t\.ex|e\.g|i\.e)\.")
 _MARKDOWN_CHARS = set("_*~`#[]<>|")
 
@@ -334,8 +343,9 @@ def select_for_ai(cells: list[CellStats], max_cells: int) -> list[CellStats]:
 
 
 def _terminator_count(text: str) -> int:
-    """Sentence endings. Decimals and a few abbreviations are not endings."""
+    """Sentence endings. Decimals, ordinals, and a few abbreviations are not endings."""
     stripped = re.sub(r"\d+\.\d+", "", text)
+    stripped = re.sub(r"\b\d+\.(?=\s)", "", stripped)  # "22. November"
     stripped = _ABBREV_RE.sub("", stripped)
     return sum(stripped.count(ch) for ch in _TERMINATORS)
 
@@ -378,30 +388,90 @@ def _is_short_decimal(groups: list[str], separators: list[str]) -> bool:
 
 
 def _is_thousands_group(groups: list[str], separators: list[str]) -> bool:
-    """``1 234 567`` only. ``123 456 789`` and ``1 800 555 010`` are phones."""
-    if any(separator != " " for separator in separators):
+    """``1 234 567`` only. Not ``12 345 678``, ``55 501``, or ``123 456 789``."""
+    if len(groups) != 3 or len(separators) != 2:
         return False
-    if not 2 <= len(groups) <= 3:
+    if any(separator.strip() != "" or separator == "" for separator in separators):
         return False
-    if not 1 <= len(groups[0]) <= 2:
+    if any(ch not in " \t" for separator in separators for ch in separator):
+        return False
+    if len(groups[0]) != 1:
         return False
     return all(len(group) == 3 for group in groups[1:])
 
 
+def _is_small_range(groups: list[str], separators: list[str]) -> bool:
+    """``2-4``, ``10-20``, ``2–4``, and Japanese ``2〜4``. Not ``555–0100``."""
+    if len(groups) != 2 or len(separators) != 1:
+        return False
+    mark = separators[0].strip()
+    if mark not in {"-", "–", "〜", "～"}:
+        return False
+    return all(1 <= len(group) <= 2 for group in groups)
+
+
+def _is_iso_date(groups: list[str], separators: list[str]) -> bool:
+    if len(groups) != 3 or len(separators) != 2:
+        return False
+    if any(separator.strip() != "-" for separator in separators):
+        return False
+    year, month, day = groups
+    return len(year) == 4 and len(month) == 2 and len(day) == 2
+
+
+def _phone_chunks(body: str):
+    for match in _PHONE_CHUNK_RE.finditer(body):
+        parts = re.split(r"(\d+)", match.group(0))
+        groups = [part for part in parts if part.isdigit()]
+        separators = [part for part in parts if part and not part.isdigit()]
+        yield groups, separators
+
+
 def _looks_like_phone(body: str) -> bool:
-    """Phone-like numbers. Depths, short decimals, and one thousands group stay."""
+    """Phone-like numbers. Depths, short decimals, ranges, and ``1 234 567`` stay."""
     if _PHONE_RUN_RE.search(body):
         return True
     if re.search(r"\(\d{2,}\)", body):
         return True
     if "+" in body and len(re.findall(r"\d", body)) >= 7:
         return True
-    for match in re.finditer(r"\d+(?:[ .\-]\d+)+", body):
-        chunk = match.group(0)
-        groups = re.findall(r"\d+", chunk)
-        separators = re.findall(r"[ .\-]", chunk)
-        if _is_short_decimal(groups, separators) or _is_thousands_group(groups, separators):
+    for groups, separators in _phone_chunks(body):
+        if (
+            _is_short_decimal(groups, separators)
+            or _is_thousands_group(groups, separators)
+            or _is_small_range(groups, separators)
+            or _is_iso_date(groups, separators)
+        ):
             continue
+        return True
+    return False
+
+
+def _idn_or_punycode(text: str) -> bool:
+    """Non-ASCII names and TLDs, and punycode. ``22. November`` is not a domain."""
+    if re.search(r"(?i)(?:^|[^A-Za-z0-9-])xn--[a-z0-9-]", text):
+        return True
+    for match in re.finditer(r"(\S+)\.(\S+)", text):
+        left = match.group(1).strip(".,;:!?")
+        right = match.group(2).strip(".,;:!?")
+        if not left or not right or left.isdigit() or len(right) < 2:
+            continue
+        if any(ch.isalpha() and ord(ch) > 127 for ch in left + right):
+            return True
+    return False
+
+
+def _spoken_domain(body: str) -> bool:
+    for match in _DOT_WORD_RE.finditer(body):
+        keyword = match.group(1).lower()
+        tld = re.sub(r"\s+", "", match.group(2)).lower()
+        if keyword == "point" and tld not in _POINT_TLDS:
+            continue
+        # "is" and "to" are ordinary words when a non-word character precedes them.
+        if tld in {"is", "to"}:
+            start = match.start(2)
+            if start == 0 or not body[start - 1].isalnum():
+                continue
         return True
     return False
 
@@ -419,9 +489,16 @@ def _unsafe_prose(body: str) -> bool:
     if _SCHEME_RE.search(body):
         return True
     normalized = _normalize_dots(body)
-    if _DOMAIN_RE.search(normalized) or _SPACED_DOT_RE.search(normalized) or _DOTCOM_RE.search(body):
+    if (
+        _DOMAIN_RE.search(normalized)
+        or _SPACED_DOT_RE.search(normalized)
+        or _DOTCOM_RE.search(body)
+        or _idn_or_punycode(normalized)
+        or re.search(r"(?i)(?<![A-Za-z0-9])\s*\.\s*com(?![A-Za-z0-9])", normalized)
+        or re.search(r"点\s*\.?\s*com", body, re.IGNORECASE)
+    ):
         return True
-    if any(match.group(1).lower() not in _DOT_TLD_SKIP for match in _DOT_WORD_RE.finditer(body)):
+    if _spoken_domain(body):
         return True
     if _looks_like_phone(body):
         return True
@@ -679,12 +756,13 @@ def _valid_model(model: str) -> bool:
     return bool(_MODEL_RE.fullmatch(model))
 
 
-def _local_http_allowed() -> bool:
-    """Test-only. Production stays https so the key is not sent in clear."""
-    return os.environ.get("SNOWMAP_AI_ALLOW_HTTP_LOCALHOST", "").strip() == "1"
+def _local_http_allowed(env: Mapping[str, str] | None = None) -> bool:
+    """Test-only. A mapping passed to ``load_config`` is not mixed with ``os.environ``."""
+    source = os.environ if env is None else env
+    return source.get("SNOWMAP_AI_ALLOW_HTTP_LOCALHOST", "").strip() == "1"
 
 
-def _valid_base(url: str) -> bool:
+def _valid_base(url: str, env: Mapping[str, str] | None = None) -> bool:
     if not url or len(url) > 200:
         return False
     parts = urllib.parse.urlsplit(url)
@@ -693,7 +771,7 @@ def _valid_base(url: str) -> bool:
     if parts.scheme == "https":
         return True
     return (
-        _local_http_allowed()
+        _local_http_allowed(env)
         and parts.scheme == "http"
         and parts.hostname in {"127.0.0.1", "localhost"}
     )
@@ -764,7 +842,7 @@ def load_config(env: Mapping[str, str] | None = None) -> AIConfig:
         return AIConfig("", base, model, max_calls, False, "no API key")
     if not base or not model:
         return AIConfig(key, base, model, max_calls, False, "base URL or model is unset")
-    if not _valid_base(base):
+    if not _valid_base(base, source):
         return AIConfig(key, "", model, max_calls, False, "base URL was rejected")
     if not _valid_model(model):
         return AIConfig(key, base, "", max_calls, False, "model name was rejected")
