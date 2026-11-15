@@ -116,8 +116,8 @@ ikke én per dag. Temperatur, nedbør og tiårshistorikk er ikke med.
 ren tekst og beholder ordene om den videre regionen. Uten navn byttes tokenet
 ut med et generelt ord («området» / «the area»), det slettes ikke alene.
 Før publisering forkastes en linje som har mer enn ett punktum, en URL, et
-bart domenenavn (`evil-example.com`), et telefonnummer (seks siffer på rad,
-eller siffer gruppert som et nummer), et skjema (`javascript:`, `https:`),
+bart domenenavn (`evil-example.com`, også klistret til kinesisk eller japansk tekst),
+et telefonlignende tall (`555 0100`, `55501`), et skjema (`javascript:`, `https:`, `tel:`),
 markdown (`_`, `*`, `` ` ``), HTML eller emoji. Japansk og kinesisk må
 inneholde CJK, og høyst 90 tegn, samme tall som i prompten. En ikke-engelsk
 linje som er identisk med den engelske, eller en latinsk linje som mest

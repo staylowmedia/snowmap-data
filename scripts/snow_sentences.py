@@ -76,12 +76,32 @@ _MODEL_RE = re.compile(r"[A-Za-z0-9._:/-]{1,80}")
 _ALLOWED_FULL_RE = re.compile(r"(?:[^\W_]|[\s.,;:'’\"()%，、。！？\-\u2013])+$", re.UNICODE)
 _TERMINATORS = set(".!?。！？")
 _SCHEME_RE = re.compile(r"(?i)(?:javascript|data|vbscript|mailto|https?|file|tel)\s*:|://")
+# ASCII-only edges. \w would treat CJK as a boundary and miss "雪snowdeals.com".
+_NOT_ASCII_BEFORE = r"(?<![A-Za-z0-9-])"
+_NOT_ASCII_AFTER = r"(?![A-Za-z0-9-])"
 # Each label is at least two characters, so "t.ex" and "z.B" are not domains.
 _DOMAIN_RE = re.compile(
-    r"(?i)(?<![\w@])(?:[a-z0-9][a-z0-9-]{0,61}[a-z0-9]\.)+[a-z]{2,}(?![\w@])"
+    _NOT_ASCII_BEFORE
+    + r"(?:[A-Za-z0-9][A-Za-z0-9-]{0,61}[A-Za-z0-9]\.)+[A-Za-z]{2,}"
+    + _NOT_ASCII_AFTER
 )
-_DOT_WORD_RE = re.compile(r"(?i)(?<![\w@])[a-z0-9]{2,}(?:-[a-z0-9]+)*\s+dot\s+[a-z]{2,}(?![\w@])")
-_PHONE_RUN_RE = re.compile(r"\d{6,}")
+_DOT_WORD_RE = re.compile(
+    _NOT_ASCII_BEFORE
+    + r"[A-Za-z0-9]{2,}(?:-[A-Za-z0-9]+)*"
+    + r"\s*(?:\(\s*)?(?:dot|d0t|punktum|punkt|point)(?:\s*\))?\s+"
+    + r"([A-Za-z]{2,})"
+    + _NOT_ASCII_AFTER,
+    re.IGNORECASE,
+)
+_SPACED_DOT_RE = re.compile(
+    _NOT_ASCII_BEFORE
+    + r"[A-Za-z0-9][A-Za-z0-9-]{2,61}[A-Za-z0-9]\.\s+[A-Za-z]{2,}"
+    + _NOT_ASCII_AFTER
+)
+_DOTCOM_RE = re.compile(_NOT_ASCII_BEFORE + r"[A-Za-z0-9]{2,}dotcom" + _NOT_ASCII_AFTER, re.IGNORECASE)
+_DOT_TLD_SKIP = frozenset({"is", "the", "of", "to", "an", "or", "cm", "mm", "and"})
+# Five digits in a row is a phone, not a snow depth we print. 55501 is rejected; 9999 cm is not.
+_PHONE_RUN_RE = re.compile(r"\d{5,}")
 _ABBREV_RE = re.compile(r"(?i)\b(?:ca|mr|mrs|dr|z\.b|t\.ex|e\.g|i\.e)\.")
 _MARKDOWN_CHARS = set("_*~`#[]<>|")
 
@@ -347,20 +367,40 @@ def _normalize_dots(text: str) -> str:
     return text.replace("。", ".").replace("．", ".").replace("｡", ".")
 
 
+def _is_short_decimal(groups: list[str], separators: list[str]) -> bool:
+    """``12.5`` and ``15.11``. Not ``555.0100``."""
+    if separators != ["."]:
+        return False
+    if len(groups) != 2:
+        return False
+    whole, fraction = groups
+    return 1 <= len(whole) <= 4 and 1 <= len(fraction) <= 2
+
+
+def _is_thousands_group(groups: list[str], separators: list[str]) -> bool:
+    """``1 234 567`` only. ``123 456 789`` and ``1 800 555 010`` are phones."""
+    if any(separator != " " for separator in separators):
+        return False
+    if not 2 <= len(groups) <= 3:
+        return False
+    if not 1 <= len(groups[0]) <= 2:
+        return False
+    return all(len(group) == 3 for group in groups[1:])
+
+
 def _looks_like_phone(body: str) -> bool:
-    """Long digit runs and uneven groups. Thousands groups like ``1 234 567`` stay."""
+    """Phone-like numbers. Depths, short decimals, and one thousands group stay."""
     if _PHONE_RUN_RE.search(body):
         return True
     if re.search(r"\(\d{2,}\)", body):
         return True
-    if "+" in body and len(re.findall(r"\d", body)) >= 8:
+    if "+" in body and len(re.findall(r"\d", body)) >= 7:
         return True
-    for match in re.finditer(r"\d{1,4}(?:[ .\-]\d{2,4}){2,}", body):
-        groups = re.split(r"[ .\-]", match.group(0))
-        digits = sum(len(group) for group in groups)
-        if digits < 8:
-            continue
-        if 1 <= len(groups[0]) <= 3 and all(len(group) == 3 for group in groups[1:]):
+    for match in re.finditer(r"\d+(?:[ .\-]\d+)+", body):
+        chunk = match.group(0)
+        groups = re.findall(r"\d+", chunk)
+        separators = re.findall(r"[ .\-]", chunk)
+        if _is_short_decimal(groups, separators) or _is_thousands_group(groups, separators):
             continue
         return True
     return False
@@ -379,7 +419,9 @@ def _unsafe_prose(body: str) -> bool:
     if _SCHEME_RE.search(body):
         return True
     normalized = _normalize_dots(body)
-    if _DOMAIN_RE.search(normalized) or _DOT_WORD_RE.search(body):
+    if _DOMAIN_RE.search(normalized) or _SPACED_DOT_RE.search(normalized) or _DOTCOM_RE.search(body):
+        return True
+    if any(match.group(1).lower() not in _DOT_TLD_SKIP for match in _DOT_WORD_RE.finditer(body)):
         return True
     if _looks_like_phone(body):
         return True
@@ -579,13 +621,9 @@ def rule_text(cell: CellStats, lang: str) -> str:
     else:
         number = max(shown_cm(cell.mean_cm), 1 if "{n}" in _RULES[kind][lang] else 0)
     cleaned = _fill_rule(kind, lang, number)
-    if cleaned is not None:
-        return cleaned
-    # Same condition and language. A shorter number keeps a long CJK line inside
-    # the character cap. Never substitute the English "little or no snow" line.
-    print(f"  sentences: rule template {kind}/{lang} failed; retrying the same line")
-    cleaned = _fill_rule(kind, lang, min(number, 99))
     if cleaned is None:
+        # The template itself is wrong. Tests fail on this; do not publish a
+        # different depth or the English no-snow line.
         raise RuntimeError(f"rule text failed for {kind}/{lang}")
     return cleaned
 
@@ -641,6 +679,11 @@ def _valid_model(model: str) -> bool:
     return bool(_MODEL_RE.fullmatch(model))
 
 
+def _local_http_allowed() -> bool:
+    """Test-only. Production stays https so the key is not sent in clear."""
+    return os.environ.get("SNOWMAP_AI_ALLOW_HTTP_LOCALHOST", "").strip() == "1"
+
+
 def _valid_base(url: str) -> bool:
     if not url or len(url) > 200:
         return False
@@ -649,8 +692,11 @@ def _valid_base(url: str) -> bool:
         return False
     if parts.scheme == "https":
         return True
-    # Local tests only. Anything else must be https so the key is not sent in clear.
-    return parts.scheme == "http" and parts.hostname in {"127.0.0.1", "localhost"}
+    return (
+        _local_http_allowed()
+        and parts.scheme == "http"
+        and parts.hostname in {"127.0.0.1", "localhost"}
+    )
 
 
 def chat_url(base: str) -> str:
@@ -775,7 +821,11 @@ def post_chat(url: str, key: str, model: str, messages: list[dict[str, str]], ti
     if parts.scheme == "https":
         conn: http.client.HTTPConnection = http.client.HTTPSConnection(
             parts.hostname, parts.port or 443, timeout=timeout)
-    elif parts.scheme == "http" and parts.hostname in {"127.0.0.1", "localhost"}:
+    elif (
+        _local_http_allowed()
+        and parts.scheme == "http"
+        and parts.hostname in {"127.0.0.1", "localhost"}
+    ):
         conn = http.client.HTTPConnection(parts.hostname, parts.port or 80, timeout=timeout)
     else:
         raise ValueError("only https URLs are allowed")
