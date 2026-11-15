@@ -55,15 +55,16 @@ BATCH_SIZE = 8
 HARD_MAX_CALLS = 16
 REQUEST_TIMEOUT_S = 12   # wall-clock seconds for one call, not an idle timeout
 AI_BUDGET_S = 60          # wall-clock seconds for the whole AI step
-# A full batch (8 cells, 10 languages, at the length cap) is about 4,123 tokens.
-# 5120 leaves room so a max-length reply is not cut off and discarded.
-MAX_TOKENS = 5120
+# A full batch at the length cap is about 4,923 tokens. 6144 leaves headroom
+# so that reply is not truncated and discarded.
+MAX_TOKENS = 6144
 MAX_RESPONSE_BYTES = 512_000
 
 MAX_CHARS = 180
 MAX_WORDS = 18
 MIN_WORDS = 3
 MAX_CJK_CHARS = 90
+MIN_CJK_CHARS = 4
 MIN_CHARS = 8
 
 USER_AGENT = "snowmap-data (github.com/staylowmedia/snowmap-data)"
@@ -71,14 +72,17 @@ SAFE_SENTENCE = "Around {place} and the wider region, there is little or no snow
 
 _MODEL_RE = re.compile(r"[A-Za-z0-9._:/-]{1,80}")
 # Underscore is excluded on purpose: \w would otherwise allow markdown _emphasis_.
-_ALLOWED_FULL_RE = re.compile(r"(?:[^\W_]|[\s.,;:'’\"()%，、。！？\-])+$", re.UNICODE)
+# En dash is allowed so "2–4 cm" is not rejected. Underscore stays out.
+_ALLOWED_FULL_RE = re.compile(r"(?:[^\W_]|[\s.,;:'’\"()%，、。！？\-\u2013])+$", re.UNICODE)
 _TERMINATORS = set(".!?。！？")
-_SCHEME_RE = re.compile(r"(?i)(?:javascript|data|vbscript|mailto|https?|file)\s*:|://")
+_SCHEME_RE = re.compile(r"(?i)(?:javascript|data|vbscript|mailto|https?|file|tel)\s*:|://")
+# Each label is at least two characters, so "t.ex" and "z.B" are not domains.
 _DOMAIN_RE = re.compile(
-    r"(?i)(?<![\w@])(?:[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?\.)+(?:[a-z]{2,})(?![\w@])"
+    r"(?i)(?<![\w@])(?:[a-z0-9][a-z0-9-]{0,61}[a-z0-9]\.)+[a-z]{2,}(?![\w@])"
 )
+_DOT_WORD_RE = re.compile(r"(?i)(?<![\w@])[a-z0-9]{2,}(?:-[a-z0-9]+)*\s+dot\s+[a-z]{2,}(?![\w@])")
 _PHONE_RUN_RE = re.compile(r"\d{6,}")
-_PHONE_GROUP_RE = re.compile(r"(?<!\w)\+?\d(?:[\d\s().-]{5,}\d)")
+_ABBREV_RE = re.compile(r"(?i)\b(?:ca|mr|mrs|dr|z\.b|t\.ex|e\.g|i\.e)\.")
 _MARKDOWN_CHARS = set("_*~`#[]<>|")
 
 
@@ -310,31 +314,75 @@ def select_for_ai(cells: list[CellStats], max_cells: int) -> list[CellStats]:
 
 
 def _terminator_count(text: str) -> int:
-    return sum(text.count(ch) for ch in _TERMINATORS)
+    """Sentence endings. Decimals and a few abbreviations are not endings."""
+    stripped = re.sub(r"\d+\.\d+", "", text)
+    stripped = _ABBREV_RE.sub("", stripped)
+    return sum(stripped.count(ch) for ch in _TERMINATORS)
+
+
+def _cjk_count(text: str) -> int:
+    count = 0
+    for ch in text:
+        code = ord(ch)
+        if 0x3040 <= code <= 0x30FF or 0x3400 <= code <= 0x9FFF or 0xF900 <= code <= 0xFAFF:
+            count += 1
+    return count
+
+
+def _has_confusable(text: str) -> bool:
+    """Cyrillic, Greek, fullwidth, and math alphanumeric lookalikes."""
+    for ch in text:
+        code = ord(ch)
+        if 0x0370 <= code <= 0x03FF or 0x0400 <= code <= 0x052F or 0x1F00 <= code <= 0x1FFF:
+            return True
+        # Fullwidth Latin letters and digits, not CJK punctuation such as "，".
+        if 0xFF10 <= code <= 0xFF19 or 0xFF21 <= code <= 0xFF3A or 0xFF41 <= code <= 0xFF5A:
+            return True
+        if 0x1D400 <= code <= 0x1D7FF:
+            return True
+    return False
+
+
+def _normalize_dots(text: str) -> str:
+    return text.replace("。", ".").replace("．", ".").replace("｡", ".")
+
+
+def _looks_like_phone(body: str) -> bool:
+    """Long digit runs and uneven groups. Thousands groups like ``1 234 567`` stay."""
+    if _PHONE_RUN_RE.search(body):
+        return True
+    if re.search(r"\(\d{2,}\)", body):
+        return True
+    if "+" in body and len(re.findall(r"\d", body)) >= 8:
+        return True
+    for match in re.finditer(r"\d{1,4}(?:[ .\-]\d{2,4}){2,}", body):
+        groups = re.split(r"[ .\-]", match.group(0))
+        digits = sum(len(group) for group in groups)
+        if digits < 8:
+            continue
+        if 1 <= len(groups[0]) <= 3 and all(len(group) == 3 for group in groups[1:]):
+            continue
+        return True
+    return False
 
 
 def _unsafe_prose(body: str) -> bool:
     """Reject URLs, bare domains, phone numbers, schemes, and markdown.
 
     Domain and phone checks look at tokens, not a single substring such as
-    ``http``.
+    ``http``. Ideographic dots and the word "dot" count as domain separators.
     """
     if any(ch in body for ch in _MARKDOWN_CHARS):
         return True
+    if _has_confusable(body):
+        return True
     if _SCHEME_RE.search(body):
         return True
-    if _DOMAIN_RE.search(body):
+    normalized = _normalize_dots(body)
+    if _DOMAIN_RE.search(normalized) or _DOT_WORD_RE.search(body):
         return True
-    if _PHONE_RUN_RE.search(body) or _PHONE_GROUP_RE.search(body):
+    if _looks_like_phone(body):
         return True
-    return False
-
-
-def _has_cjk(text: str) -> bool:
-    for ch in text:
-        code = ord(ch)
-        if 0x3040 <= code <= 0x30FF or 0x3400 <= code <= 0x9FFF or 0xF900 <= code <= 0xFAFF:
-            return True
     return False
 
 
@@ -364,7 +412,7 @@ def script_ok(text: str, lang: str, english: str | None) -> bool:
     if lang != "en" and english is not None and text == english:
         return False
     if lang in CJK:
-        return _has_cjk(text)
+        return _cjk_count(text) >= MIN_CJK_CHARS
     return not _non_latin_dominates(text)
 
 
@@ -462,7 +510,7 @@ _RULES: dict[str, dict[str, str]] = {
         "de": "In der weiteren Region um {place} liegt fleckenweise etwa {n} cm Schnee, und es wird mehr.",
         "fr": "Dans la région autour de {place}, neige éparse d'environ {n} cm, et davantage est attendu.",
         "es": "En la región alrededor de {place} hay nieve irregular, unos {n} cm, y se espera más.",
-        "it": "Nella regione intorno a {place} la neve a chiazze è di circa {n} cm, e se ne attende altra.",
+        "it": "Nella regione intorno a {place} c'è neve a chiazze, circa {n} cm, e ne arriva altra.",
         "pt-BR": "Na região ao redor de {place} a neve irregular média é de {n} cm, com mais a caminho.",
         "ja": "{place}周辺の広い地域では、まだらの雪は平均約{n}cmで、さらに増える見込みです。",
         "zh-Hans": "在{place}周边的更大范围内，不均匀积雪平均约{n}厘米，预计还会增加。",
@@ -518,21 +566,27 @@ _RULES: dict[str, dict[str, str]] = {
 }
 
 
+def _fill_rule(kind: str, lang: str, number: int) -> str | None:
+    template = _RULES[kind][lang].replace("{n}", str(number))
+    english = None if lang == "en" else _RULES[kind]["en"].replace("{n}", str(number))
+    return accept_sentence(template, lang, english)
+
+
 def rule_text(cell: CellStats, lang: str) -> str:
     kind = kind_of(cell)
     if kind == "incoming":
         number = shown_cm(cell.later_mean_cm)
     else:
         number = max(shown_cm(cell.mean_cm), 1 if "{n}" in _RULES[kind][lang] else 0)
-    template = _RULES[kind][lang]
-    text = template.replace("{n}", str(number))
-    english = None if lang == "en" else _RULES[kind]["en"].replace("{n}", str(number))
-    cleaned = accept_sentence(text, lang, english)
+    cleaned = _fill_rule(kind, lang, number)
+    if cleaned is not None:
+        return cleaned
+    # Same condition and language. A shorter number keeps a long CJK line inside
+    # the character cap. Never substitute the English "little or no snow" line.
+    print(f"  sentences: rule template {kind}/{lang} failed; retrying the same line")
+    cleaned = _fill_rule(kind, lang, min(number, 99))
     if cleaned is None:
-        fallback = validate_sentence(SAFE_SENTENCE, "en")
-        if fallback is None:
-            raise RuntimeError("safe sentence failed validation")
-        return fallback
+        raise RuntimeError(f"rule text failed for {kind}/{lang}")
     return cleaned
 
 
@@ -588,14 +642,15 @@ def _valid_model(model: str) -> bool:
 
 
 def _valid_base(url: str) -> bool:
-    if not url or len(url) > 200 or not url.startswith("https://"):
+    if not url or len(url) > 200:
         return False
     parts = urllib.parse.urlsplit(url)
-    if parts.username or parts.password or parts.query or parts.fragment:
+    if parts.username or parts.password or parts.query or parts.fragment or not parts.hostname:
         return False
-    if parts.scheme != "https" or not parts.hostname:
-        return False
-    return True
+    if parts.scheme == "https":
+        return True
+    # Local tests only. Anything else must be https so the key is not sent in clear.
+    return parts.scheme == "http" and parts.hostname in {"127.0.0.1", "localhost"}
 
 
 def chat_url(base: str) -> str:
@@ -1046,6 +1101,25 @@ def write_sentences(
         inputs.unlink(missing_ok=True)
 
 
+def _temp_path(path: Path) -> Path:
+    """Temp file outside ``site/``, which is what GitHub Pages publishes."""
+    if "site" in path.parts:
+        directory = Path("build")
+        directory.mkdir(parents=True, exist_ok=True)
+        return directory / (path.name + ".tmp")
+    return path.with_name(path.name + ".tmp")
+
+
+def _atomic_write(path: Path, document: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = _temp_path(path)
+    try:
+        temporary.write_text(json.dumps(document, ensure_ascii=False, separators=(",", ":")) + "\n", encoding="utf-8")
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--sentences", default="site/snow/ai_sentences.json")
@@ -1056,14 +1130,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-
-
-def _atomic_write(path: Path, document: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(path.name + ".tmp")
-    try:
-        temporary.write_text(json.dumps(document, ensure_ascii=False, separators=(",", ":")) + "\n", encoding="utf-8")
-        os.replace(temporary, path)
-    except Exception:
-        temporary.unlink(missing_ok=True)
-        raise

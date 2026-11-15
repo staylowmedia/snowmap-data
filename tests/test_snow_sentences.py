@@ -146,6 +146,68 @@ class RuleAndValidationTest(unittest.TestCase):
         self.assertIsNone(snow.accept_sentence(good, "nb", good))
         self.assertIsNone(snow.accept_sentence(
             "{place}周辺だけの短い文です。", "en", None))
+        self.assertIsNone(snow.validate_sentence(
+            "Around {place} and the wider region, see example。com today.", "en"))
+        self.assertIsNone(snow.validate_sentence(
+            "Around {place} and the wider region, see example dot com today.", "en"))
+        self.assertIsNone(snow.validate_sentence(
+            "Around {place} and the wider region, call tel:123456 now.", "en"))
+        self.assertIsNone(snow.validate_sentence(
+            "Around {place} and the wider regiоn, snow is solid today.", "en"))  # Cyrillic о
+        self.assertIsNone(snow.validate_sentence(
+            "Around {place} and the wider region, Ａ snow is solid today.", "en"))
+        self.assertEqual(snow.validate_sentence(
+            "Around {place} and the wider region, about 12.5 cm of snow.", "en"),
+            "Around {place} and the wider region, about 12.5 cm of snow.")
+        self.assertIsNotNone(snow.validate_sentence(
+            "Around {place} and the wider region, ca. 12 cm of snow.", "en"))
+        self.assertIsNotNone(snow.validate_sentence(
+            "In der weiteren Region um {place} liegt z.B. etwas Schnee.", "de"))
+        self.assertIsNotNone(snow.validate_sentence(
+            "I regionen runt {place} är snön t.ex. fläckvis idag.", "sv"))
+        self.assertIsNotNone(snow.validate_sentence(
+            "Around {place} and the wider region, on 15.11 snow is patchy.", "en"))
+        self.assertIsNotNone(snow.validate_sentence(
+            "Around {place} and the wider region, about 2–4 cm of snow.", "en"))
+        self.assertIsNotNone(snow.validate_sentence(
+            "Around {place} and the wider region, about 1 234 567 cm of snow.", "en"))
+        almost = "{place}雪です。"
+        self.assertEqual(snow._cjk_count(almost), 3)
+        self.assertIsNone(snow.accept_sentence(almost, "ja", None))
+        filler = "雪" * (snow.MAX_CJK_CHARS - len("{place}"))
+        enough = "{place}" + filler
+        self.assertEqual(len(enough), snow.MAX_CJK_CHARS)
+        self.assertEqual(snow.validate_sentence(enough, "ja"), enough)
+        self.assertIsNone(snow.validate_sentence(enough + "雪", "ja"))
+
+    def test_every_rule_passes_for_every_depth(self):
+        english_none = snow.SAFE_SENTENCE
+        for kind in snow._RULES:
+            for number in (1, 5, 10, 12, 40, 100, 999):
+                for lang in snow.LANGUAGES:
+                    text = snow._RULES[kind][lang].replace("{n}", str(number))
+                    english = None if lang == "en" else snow._RULES[kind]["en"].replace("{n}", str(number))
+                    self.assertEqual(snow.accept_sentence(text, lang, english), text, f"{kind} {lang} {number}")
+                    if lang != "en":
+                        self.assertNotEqual(text, english_none)
+
+    def test_rule_fallback_stays_in_the_same_language(self):
+        item = cell(mean_cm=8, max_cm=30, fraction=0.4, later_mean_cm=20)
+        self.assertEqual(snow.kind_of(item), "patchy_up")
+        real = snow.accept_sentence
+        calls = {"n": 0}
+
+        def fail_once(text, lang, english):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return None
+            return real(text, lang, english)
+
+        with mock.patch("snow_sentences.accept_sentence", side_effect=fail_once):
+            text = snow.rule_text(item, "it")
+        self.assertNotEqual(text, snow.SAFE_SENTENCE)
+        self.assertIn("regione", text)
+        self.assertNotIn("little or no snow", text)
 
     def test_allows_one_place_token(self):
         text = "Snow cover around {place} is solid, about 12 cm."
@@ -195,6 +257,8 @@ class AppConfigTest(unittest.TestCase):
             live_ai_daily_cap=-4,
         )
         self.assertEqual(low["app_config"]["live_ai_daily_cap"], 5)
+        self.assertEqual(snow.clamp_live_ai_daily_cap(True), 5)
+        self.assertEqual(snow.clamp_live_ai_daily_cap(False), 5)
 
     def test_published_file_uses_the_env_value(self):
         cells = [cell(i=i, j=j) for i in range(snow.N_LAT) for j in range(snow.N_LON)]
@@ -729,6 +793,126 @@ class PromptBudgetTest(unittest.TestCase):
         self.assertIn(f"at most {snow.MAX_CJK_CHARS} characters", messages[0]["content"])
         self.assertNotIn("40 characters", messages[0]["content"])
         self.assertIn("wider region", messages[0]["content"])
+
+
+class BudgetTest(unittest.TestCase):
+    def test_phase_budget_and_remaining_timeout(self):
+        self.assertEqual(snow.AI_BUDGET_S, 60)
+        self.assertEqual(snow.REQUEST_TIMEOUT_S, 12)
+        self.assertEqual(snow.MAX_CJK_CHARS, 90)
+        config = snow.load_config({
+            "SNOWMAP_AI_API_KEY": "unit-test-key",
+            "SNOWMAP_AI_BASE_URL": "https://api.example.test/v1",
+            "SNOWMAP_AI_MODEL": "demo",
+        })
+        seen = []
+
+        def transport(*args):
+            seen.append(args[-1])
+            return {"choices": [{"finish_reason": "stop", "message": {"content": "{}"}}]}
+
+        item = cell(mean_cm=12, max_cm=30, fraction=0.4, later_mean_cm=20)
+        snow.apply_ai([item], config, transport, snow.time.monotonic() + 100)
+        self.assertEqual(seen, [12])
+        seen.clear()
+        snow.apply_ai([item], config, transport, snow.time.monotonic() + 4)
+        self.assertEqual(len(seen), 1)
+        self.assertLess(seen[0], 12)
+        self.assertGreater(seen[0], 3)
+        seen.clear()
+        accepted, calls = snow.apply_ai([item], config, transport, snow.time.monotonic() + 0.2)
+        self.assertEqual(calls, 0)
+        self.assertEqual(seen, [])
+        self.assertEqual(accepted, {})
+
+
+class ScriptMainTest(unittest.TestCase):
+    def test_script_writes_ai_lines(self):
+        import subprocess
+        import tempfile
+        import threading
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        sample = cell(mean_cm=20, max_cm=40, fraction=0.8, later_mean_cm=20)
+        good = {lang: snow.rule_text(sample, lang) for lang in snow.LANGUAGES}
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length", "0"))
+                raw = self.rfile.read(length)
+                body = json.loads(raw.decode("utf-8"))
+                user = body["messages"][1]["content"]
+                ids = [line.split()[0].split("=", 1)[1] for line in user.splitlines() if line.startswith("id=")]
+                payload = json.dumps({"cells": [{"id": cell_id, "sentences": good} for cell_id in ids]}).encode()
+                outer = json.dumps({
+                    "choices": [{"finish_reason": "stop", "message": {"content": payload.decode()}}],
+                }).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(outer)))
+                self.end_headers()
+                self.wfile.write(outer)
+
+            def log_message(self, *_args):
+                return
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        port = server.server_address[1]
+        root = Path(tempfile.mkdtemp())
+        try:
+            snow_dir = root / "site" / "snow"
+            snow_dir.mkdir(parents=True)
+            sentences = snow_dir / "ai_sentences.json"
+            sentences.write_text('{"schema_version":1}\n', encoding="utf-8")
+            rows = []
+            for i in range(snow.N_LAT):
+                for j in range(snow.N_LON):
+                    rows.append({"i": i, "j": j, "mean_cm": 0.0, "max_cm": 0.0, "fraction": 0.0, "later_mean_cm": 0.0, "n": 400})
+            rows[10 * snow.N_LON + 10] = {
+                "i": 10, "j": 10, "mean_cm": 8.0, "max_cm": 40.0, "fraction": 0.4, "later_mean_cm": 20.0, "n": 400,
+            }
+            inputs = root / "build" / "sentence_inputs.json"
+            inputs.parent.mkdir()
+            inputs.write_text(json.dumps({
+                "generated": "2026-11-15T06:25:00Z",
+                "run": "2026111500",
+                "first_date": "2026-11-15",
+                "last_date": "2026-11-22",
+                "live_ai_daily_cap": 5,
+                "cells": rows,
+            }), encoding="utf-8")
+            script = Path(__file__).resolve().parents[1] / "scripts" / "snow_sentences.py"
+            env = {
+                "PATH": os.environ.get("PATH", ""),
+                "SNOWMAP_AI_API_KEY": "unit-test-key-not-real",
+                "SNOWMAP_AI_BASE_URL": f"http://127.0.0.1:{port}/v1",
+                "SNOWMAP_AI_MODEL": "demo",
+                "SNOWMAP_AI_MAX_CALLS": "1",
+            }
+            completed = subprocess.run(
+                [sys.executable, str(script), "--sentences", str(sentences), "--inputs", str(inputs)],
+                cwd=root,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+            self.assertNotIn("NameError", completed.stdout + completed.stderr)
+            self.assertNotIn("unit-test-key-not-real", completed.stdout + completed.stderr)
+            document = json.loads(sentences.read_text(encoding="utf-8"))
+            row = document["cells"][10 * snow.N_LON + 10]
+            self.assertEqual(row["source"]["en"], "ai")
+            self.assertIn("{place}", row["text"]["en"])
+            self.assertGreater(document["ai_calls"], 0)
+            self.assertEqual(list(root.joinpath("site").rglob("*.tmp")), [])
+        finally:
+            server.shutdown()
+            import shutil
+            shutil.rmtree(root, ignore_errors=True)
 
 
 class PublishGuardTest(unittest.TestCase):
