@@ -11,15 +11,19 @@ deterministic rule. A failure here must not stop the image publish.
 """
 from __future__ import annotations
 
+import argparse
+import http.client
 import json
 import math
 import os
 import re
+import socket
+import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
-import urllib.request
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Callable, Mapping
 
@@ -46,9 +50,11 @@ PLACEHOLDER = "{place}"
 
 BATCH_SIZE = 8
 HARD_MAX_CALLS = 16
-REQUEST_TIMEOUT_S = 12
-AI_BUDGET_S = 60
-MAX_TOKENS = 2400
+REQUEST_TIMEOUT_S = 12   # wall-clock seconds for one call, not an idle timeout
+AI_BUDGET_S = 60          # wall-clock seconds for the whole AI step
+# A full batch (8 cells, 10 languages, at the length cap) is about 4,123 tokens.
+# 5120 leaves room so a max-length reply is not cut off and discarded.
+MAX_TOKENS = 5120
 MAX_RESPONSE_BYTES = 512_000
 
 MAX_CHARS = 180
@@ -58,13 +64,19 @@ MAX_CJK_CHARS = 90
 MIN_CHARS = 8
 
 USER_AGENT = "snowmap-data (github.com/staylowmedia/snowmap-data)"
-SAFE_SENTENCE = "Little or no snow on the ground in this area."
+SAFE_SENTENCE = "Around {place} and the wider region, there is little or no snow."
 
 _MODEL_RE = re.compile(r"[A-Za-z0-9._:/-]{1,80}")
-# Letters (any language), digits, spaces, and a small punctuation set.
-# {place} is checked separately and removed before this test.
-_ALLOWED_RE = re.compile(r"[\w\s.,;:'’\"()%，、。！？\-]+$", re.UNICODE)
+# Underscore is excluded on purpose: \w would otherwise allow markdown _emphasis_.
+_ALLOWED_FULL_RE = re.compile(r"(?:[^\W_]|[\s.,;:'’\"()%，、。！？\-])+$", re.UNICODE)
 _TERMINATORS = set(".!?。！？")
+_SCHEME_RE = re.compile(r"(?i)(?:javascript|data|vbscript|mailto|https?|file)\s*:|://")
+_DOMAIN_RE = re.compile(
+    r"(?i)(?<![\w@])(?:[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?\.)+(?:[a-z]{2,})(?![\w@])"
+)
+_PHONE_RUN_RE = re.compile(r"\d{6,}")
+_PHONE_GROUP_RE = re.compile(r"(?<!\w)\+?\d(?:[\d\s().-]{5,}\d)")
+_MARKDOWN_CHARS = set("_*~`#[]<>|")
 
 
 @dataclass(frozen=True)
@@ -298,6 +310,61 @@ def _terminator_count(text: str) -> int:
     return sum(text.count(ch) for ch in _TERMINATORS)
 
 
+def _unsafe_prose(body: str) -> bool:
+    """Reject URLs, bare domains, phone numbers, schemes, and markdown.
+
+    Domain and phone checks look at tokens, not a single substring such as
+    ``http``.
+    """
+    if any(ch in body for ch in _MARKDOWN_CHARS):
+        return True
+    if _SCHEME_RE.search(body):
+        return True
+    if _DOMAIN_RE.search(body):
+        return True
+    if _PHONE_RUN_RE.search(body) or _PHONE_GROUP_RE.search(body):
+        return True
+    return False
+
+
+def _has_cjk(text: str) -> bool:
+    for ch in text:
+        code = ord(ch)
+        if 0x3040 <= code <= 0x30FF or 0x3400 <= code <= 0x9FFF or 0xF900 <= code <= 0xFAFF:
+            return True
+    return False
+
+
+def _non_latin_dominates(text: str) -> bool:
+    latin = 0
+    other = 0
+    for ch in text:
+        if not ch.isalpha():
+            continue
+        code = ord(ch)
+        # Latin, Latin-1 supplement, and Latin Extended-A/B cover nb/sv/de/fr/es/it/pt.
+        if code <= 0x024F:
+            latin += 1
+        else:
+            other += 1
+    if latin + other == 0:
+        return True
+    return other > latin
+
+
+def script_ok(text: str, lang: str, english: str | None) -> bool:
+    """Language filter applied after the shared prose checks.
+
+    Japanese and Chinese must contain CJK. A spaced language must not be mostly
+    another script. A non-English line that copies the English line is rejected.
+    """
+    if lang != "en" and english is not None and text == english:
+        return False
+    if lang in CJK:
+        return _has_cjk(text)
+    return not _non_latin_dominates(text)
+
+
 def validate_sentence(text: str, lang: str) -> str | None:
     """Return a cleaned sentence, or None when it must not be published."""
     if not isinstance(text, str):
@@ -305,15 +372,14 @@ def validate_sentence(text: str, lang: str) -> str | None:
     cleaned = " ".join(text.split())
     if not cleaned or len(cleaned) < MIN_CHARS or len(cleaned) > MAX_CHARS:
         return None
-    if cleaned.count(PLACEHOLDER) > 1:
+    if cleaned.count(PLACEHOLDER) != 1:
         return None
     body = cleaned.replace(PLACEHOLDER, " ")
     if "{" in body or "}" in body:
         return None
-    lowered = body.lower()
-    if "http://" in lowered or "https://" in lowered or "www." in lowered or "://" in lowered:
+    if _unsafe_prose(body):
         return None
-    if not _ALLOWED_RE.fullmatch(body.strip()):
+    if not _ALLOWED_FULL_RE.fullmatch(body.strip()):
         return None
     if _terminator_count(cleaned) > 1:
         return None
@@ -327,115 +393,124 @@ def validate_sentence(text: str, lang: str) -> str | None:
     return cleaned
 
 
-# {n} is the relevant depth in whole centimetres. incoming uses the later day.
+def accept_sentence(text: str, lang: str, english: str | None) -> str | None:
+    cleaned = validate_sentence(text, lang)
+    if cleaned is None or not script_ok(cleaned, lang, english):
+        return None
+    return cleaned
+
+
+# {n} is whole centimetres. incoming uses the later day.
+# Every line names the wider region around {place}. A 5° cell is about 555 km
+# across, so the sentence must not sound like a pinpoint forecast.
 _RULES: dict[str, dict[str, str]] = {
     "none": {
-        "en": "Little or no snow on the ground in this area.",
-        "nb": "Lite eller ingen snø på bakken i dette området.",
-        "sv": "Lite eller ingen snö på marken i det här området.",
-        "de": "Wenig oder kein Schnee auf dem Boden in diesem Gebiet.",
-        "fr": "Peu ou pas de neige au sol dans cette zone.",
-        "es": "Poca o ninguna nieve en el suelo en esta zona.",
-        "it": "Poca o nessuna neve al suolo in questa zona.",
-        "pt-BR": "Pouca ou nenhuma neve no chão nesta área.",
-        "ja": "この地域の地面に雪はほとんどありません。",
-        "zh-Hans": "这一带地面几乎没有积雪。",
+        "en": "Around {place} and the wider region, there is little or no snow.",
+        "nb": "I regionen rundt {place} er det lite eller ingen snø.",
+        "sv": "I regionen runt {place} är det lite eller ingen snö.",
+        "de": "In der weiteren Region um {place} liegt kaum oder kein Schnee.",
+        "fr": "Dans la région autour de {place}, il y a peu ou pas de neige.",
+        "es": "En la región alrededor de {place} hay poca o ninguna nieve.",
+        "it": "Nella regione intorno a {place} c'è poca o nessuna neve.",
+        "pt-BR": "Na região ao redor de {place} há pouca ou nenhuma neve.",
+        "ja": "{place}周辺の広い地域では、雪はほとんどありません。",
+        "zh-Hans": "在{place}周边的更大范围内，地面几乎没有积雪。",
     },
     "incoming": {
-        "en": "Little snow here now, with about {n} cm expected within a week.",
-        "nb": "Lite snø her nå, men omtrent {n} cm er ventet i løpet av uken.",
-        "sv": "Lite snö här nu, men ungefär {n} cm väntas inom en vecka.",
-        "de": "Hier liegt jetzt kaum Schnee, etwa {n} cm binnen einer Woche.",
-        "fr": "Peu de neige ici maintenant, environ {n} cm d'ici une semaine.",
-        "es": "Hay poca nieve ahora, y se esperan unos {n} cm en una semana.",
-        "it": "Poca neve ora, ma circa {n} cm entro una settimana.",
-        "pt-BR": "Pouca neve agora, com cerca de {n} cm em uma semana.",
-        "ja": "今はほとんど雪がなく、1週間以内に約{n}cmの見込みです。",
-        "zh-Hans": "目前几乎没有积雪，一周内预计约{n}厘米。",
+        "en": "Around {place} and the wider region, about {n} cm of snow is expected this week.",
+        "nb": "I regionen rundt {place} ventes omtrent {n} cm snø i løpet av uken.",
+        "sv": "I regionen runt {place} väntas ungefär {n} cm snö inom en vecka.",
+        "de": "In der weiteren Region um {place} werden etwa {n} cm Schnee diese Woche erwartet.",
+        "fr": "Dans la région autour de {place}, environ {n} cm de neige sont attendus cette semaine.",
+        "es": "En la región alrededor de {place} se esperan unos {n} cm de nieve esta semana.",
+        "it": "Nella regione intorno a {place} sono attesi circa {n} cm di neve questa settimana.",
+        "pt-BR": "Na região ao redor de {place} esperam-se cerca de {n} cm de neve nesta semana.",
+        "ja": "{place}周辺の広い地域では、1週間以内に約{n}cmの雪が見込まれます。",
+        "zh-Hans": "在{place}周边的更大范围内，一周内预计约有{n}厘米积雪。",
     },
     "dusting": {
-        "en": "Only a thin dusting of snow in this area.",
-        "nb": "Bare et tynt dryss av snø i dette området.",
-        "sv": "Bara ett tunt lager snö i det här området.",
-        "de": "Nur eine dünne Schneeschicht in diesem Gebiet.",
-        "fr": "Seulement une fine couche de neige dans cette zone.",
-        "es": "Solo una capa muy fina de nieve en esta zona.",
-        "it": "Solo un velo sottile di neve in questa zona.",
-        "pt-BR": "Apenas uma camada fina de neve nesta área.",
-        "ja": "この地域の雪はごく薄い程度です。",
-        "zh-Hans": "这一带只有很薄的一层雪。",
+        "en": "Around {place} and the wider region, there is only a thin dusting of snow.",
+        "nb": "I regionen rundt {place} er det bare et tynt dryss av snø.",
+        "sv": "I regionen runt {place} finns bara ett tunt lager snö.",
+        "de": "In der weiteren Region um {place} liegt nur eine dünne Schneeschicht.",
+        "fr": "Dans la région autour de {place}, il n'y a qu'une fine couche de neige.",
+        "es": "En la región alrededor de {place} solo hay una capa muy fina de nieve.",
+        "it": "Nella regione intorno a {place} c'è solo un velo sottile di neve.",
+        "pt-BR": "Na região ao redor de {place} há apenas uma camada fina de neve.",
+        "ja": "{place}周辺の広い地域では、雪はごく薄い程度です。",
+        "zh-Hans": "在{place}周边的更大范围内，只有很薄的一层雪。",
     },
     "patchy": {
-        "en": "Patchy snow in this area, about {n} cm on average.",
-        "nb": "Flekkvis snø i dette området, omtrent {n} cm i snitt.",
-        "sv": "Fläckvis snö i det här området, ungefär {n} cm i snitt.",
-        "de": "Fleckenweise Schnee in diesem Gebiet, etwa {n} cm im Mittel.",
-        "fr": "Neige éparse dans cette zone, environ {n} cm en moyenne.",
-        "es": "Nieve irregular en esta zona, unos {n} cm de media.",
-        "it": "Neve a chiazze in questa zona, circa {n} cm in media.",
-        "pt-BR": "Neve irregular nesta área, cerca de {n} cm em média.",
-        "ja": "この地域の雪はまだらで、平均約{n}cmです。",
-        "zh-Hans": "这一带积雪不均匀，平均约{n}厘米。",
+        "en": "Around {place} and the wider region, snow is patchy, about {n} cm on average.",
+        "nb": "I regionen rundt {place} er snøen flekkvis, omtrent {n} cm i snitt.",
+        "sv": "I regionen runt {place} är snön fläckvis, ungefär {n} cm i snitt.",
+        "de": "In der weiteren Region um {place} liegt der Schnee fleckenweise, etwa {n} cm.",
+        "fr": "Dans la région autour de {place}, la neige est éparse, environ {n} cm en moyenne.",
+        "es": "En la región alrededor de {place} la nieve es irregular, unos {n} cm de media.",
+        "it": "Nella regione intorno a {place} la neve è a chiazze, circa {n} cm in media.",
+        "pt-BR": "Na região ao redor de {place} a neve é irregular, cerca de {n} cm em média.",
+        "ja": "{place}周辺の広い地域では、雪はまだらで平均約{n}cmです。",
+        "zh-Hans": "在{place}周边的更大范围内，积雪不均匀，平均约{n}厘米。",
     },
     "patchy_up": {
-        "en": "Patchy snow in this area, about {n} cm, with more expected.",
-        "nb": "Flekkvis snø i dette området, omtrent {n} cm, og mer er ventet.",
-        "sv": "Fläckvis snö i det här området, ungefär {n} cm, och mer väntas.",
-        "de": "Fleckenweise Schnee hier, etwa {n} cm, und es wird mehr.",
-        "fr": "Neige éparse dans cette zone, environ {n} cm, et davantage vient.",
-        "es": "Nieve irregular en esta zona, unos {n} cm, y se espera más.",
-        "it": "Neve a chiazze qui, circa {n} cm, e se ne attende altra.",
-        "pt-BR": "Neve irregular nesta área, cerca de {n} cm, com mais a caminho.",
-        "ja": "雪はまだらで平均約{n}cm、さらに増える見込みです。",
-        "zh-Hans": "这一带积雪不均匀，平均约{n}厘米，预计还会增加。",
+        "en": "Around {place} and the wider region, patchy snow averages {n} cm, with more expected.",
+        "nb": "I regionen rundt {place} er snøen flekkvis, omtrent {n} cm, og mer ventes.",
+        "sv": "I regionen runt {place} är snön fläckvis, ungefär {n} cm, och mer väntas.",
+        "de": "In der weiteren Region um {place} liegt fleckenweise etwa {n} cm Schnee, und es wird mehr.",
+        "fr": "Dans la région autour de {place}, neige éparse d'environ {n} cm, et davantage est attendu.",
+        "es": "En la región alrededor de {place} hay nieve irregular, unos {n} cm, y se espera más.",
+        "it": "Nella regione intorno a {place} la neve a chiazze è di circa {n} cm, e se ne attende altra.",
+        "pt-BR": "Na região ao redor de {place} a neve irregular média é de {n} cm, com mais a caminho.",
+        "ja": "{place}周辺の広い地域では、まだらの雪は平均約{n}cmで、さらに増える見込みです。",
+        "zh-Hans": "在{place}周边的更大范围内，不均匀积雪平均约{n}厘米，预计还会增加。",
     },
     "patchy_down": {
-        "en": "Patchy snow in this area, about {n} cm, and it should thin.",
-        "nb": "Flekkvis snø i dette området, omtrent {n} cm, og det blir tynnere.",
-        "sv": "Fläckvis snö i det här området, ungefär {n} cm, och det tunnar ut.",
-        "de": "Fleckenweise Schnee hier, etwa {n} cm, und er wird dünner.",
-        "fr": "Neige éparse dans cette zone, environ {n} cm, et elle s'amincit.",
-        "es": "Nieve irregular en esta zona, unos {n} cm, y debería adelgazar.",
-        "it": "Neve a chiazze qui, circa {n} cm, e dovrebbe assottigliarsi.",
-        "pt-BR": "Neve irregular nesta área, cerca de {n} cm, e deve afinar.",
-        "ja": "雪はまだらで平均約{n}cm、薄くなる見込みです。",
-        "zh-Hans": "这一带积雪不均匀，平均约{n}厘米，预计会变薄。",
+        "en": "Around {place} and the wider region, patchy snow averages {n} cm and should thin.",
+        "nb": "I regionen rundt {place} er snøen flekkvis, omtrent {n} cm, og den blir tynnere.",
+        "sv": "I regionen runt {place} är snön fläckvis, ungefär {n} cm, och den tunnar ut.",
+        "de": "In der weiteren Region um {place} liegt fleckenweise etwa {n} cm Schnee, und er wird dünner.",
+        "fr": "Dans la région autour de {place}, neige éparse d'environ {n} cm, et elle devrait s'amincir.",
+        "es": "En la región alrededor de {place} hay nieve irregular, unos {n} cm, y debería adelgazar.",
+        "it": "Nella regione intorno a {place} la neve a chiazze è di circa {n} cm e dovrebbe assottigliarsi.",
+        "pt-BR": "Na região ao redor de {place} a neve irregular média é de {n} cm e deve afinar.",
+        "ja": "{place}周辺の広い地域では、まだらの雪は平均約{n}cmで、薄くなる見込みです。",
+        "zh-Hans": "在{place}周边的更大范围内，不均匀积雪平均约{n}厘米，预计会变薄。",
     },
     "solid": {
-        "en": "Solid snow cover in this area, about {n} cm on average.",
-        "nb": "Solid snødekke i dette området, omtrent {n} cm i snitt.",
-        "sv": "Rejält snötäcke i det här området, ungefär {n} cm i snitt.",
-        "de": "Geschlossene Schneedecke in diesem Gebiet, etwa {n} cm im Mittel.",
-        "fr": "Manteau neigeux continu dans cette zone, environ {n} cm en moyenne.",
-        "es": "Capa de nieve continua en esta zona, unos {n} cm de media.",
-        "it": "Manto nevoso continuo in questa zona, circa {n} cm in media.",
-        "pt-BR": "Cobertura de neve contínua nesta área, cerca de {n} cm em média.",
-        "ja": "この地域は積雪が厚く、平均約{n}cmです。",
-        "zh-Hans": "这一带积雪较厚，平均约{n}厘米。",
+        "en": "Around {place} and the wider region, snow cover is solid, about {n} cm.",
+        "nb": "I regionen rundt {place} er snødekket solid, omtrent {n} cm i snitt.",
+        "sv": "I regionen runt {place} är snötäcket rejält, ungefär {n} cm i snitt.",
+        "de": "In der weiteren Region um {place} liegt eine geschlossene Decke von etwa {n} cm.",
+        "fr": "Dans la région autour de {place}, le manteau neigeux est continu, environ {n} cm.",
+        "es": "En la región alrededor de {place} la capa de nieve es continua, unos {n} cm.",
+        "it": "Nella regione intorno a {place} il manto nevoso è continuo, circa {n} cm.",
+        "pt-BR": "Na região ao redor de {place} a cobertura de neve é contínua, cerca de {n} cm.",
+        "ja": "{place}周辺の広い地域では、積雪は厚く、平均約{n}cmです。",
+        "zh-Hans": "在{place}周边的更大范围内，积雪较厚，平均约{n}厘米。",
     },
     "solid_up": {
-        "en": "Solid snow cover in this area, about {n} cm, with more expected.",
-        "nb": "Solid snødekke i dette området, omtrent {n} cm, og mer er ventet.",
-        "sv": "Rejält snötäcke i det här området, ungefär {n} cm, och mer väntas.",
-        "de": "Geschlossene Schneedecke hier, etwa {n} cm, und es wird mehr.",
-        "fr": "Manteau neigeux continu ici, environ {n} cm, et davantage vient.",
-        "es": "Capa de nieve continua aquí, unos {n} cm, y se espera más.",
-        "it": "Manto nevoso continuo qui, circa {n} cm, e se ne attende altra.",
-        "pt-BR": "Cobertura contínua nesta área, cerca de {n} cm, com mais a caminho.",
-        "ja": "積雪は厚く平均約{n}cmで、さらに増える見込みです。",
-        "zh-Hans": "这一带平均积雪约{n}厘米，预计还会增加。",
+        "en": "Around {place} and the wider region, solid snow averages {n} cm, with more expected.",
+        "nb": "I regionen rundt {place} er snødekket solid, omtrent {n} cm, og mer ventes.",
+        "sv": "I regionen runt {place} är snötäcket rejält, ungefär {n} cm, och mer väntas.",
+        "de": "In der weiteren Region um {place} liegt etwa {n} cm Schnee, und es wird mehr.",
+        "fr": "Dans la région autour de {place}, manteau continu d'environ {n} cm, et davantage est attendu.",
+        "es": "En la región alrededor de {place} la nieve continua promedia {n} cm, y se espera más.",
+        "it": "Nella regione intorno a {place} il manto continuo è di circa {n} cm, e se ne attende altra.",
+        "pt-BR": "Na região ao redor de {place} a neve contínua média é de {n} cm, com mais a caminho.",
+        "ja": "{place}周辺の広い地域では、厚い積雪は平均約{n}cmで、さらに増える見込みです。",
+        "zh-Hans": "在{place}周边的更大范围内，较厚积雪平均约{n}厘米，预计还会增加。",
     },
     "solid_down": {
-        "en": "Solid snow cover in this area, about {n} cm, but it should thin.",
-        "nb": "Solid snødekke i dette området, omtrent {n} cm, men det blir tynnere.",
-        "sv": "Rejält snötäcke i det här området, ungefär {n} cm, men det tunnar ut.",
-        "de": "Geschlossene Schneedecke hier, etwa {n} cm, aber sie wird dünner.",
-        "fr": "Manteau neigeux continu ici, environ {n} cm, mais il s'amincit.",
-        "es": "Capa de nieve continua aquí, unos {n} cm, pero debería adelgazar.",
-        "it": "Manto nevoso continuo qui, circa {n} cm, ma si assottiglia.",
-        "pt-BR": "Cobertura contínua nesta área, cerca de {n} cm, mas deve afinar.",
-        "ja": "積雪は厚く平均約{n}cmですが、薄くなる見込みです。",
-        "zh-Hans": "这一带平均积雪约{n}厘米，但预计会变薄。",
+        "en": "Around {place} and the wider region, solid snow averages {n} cm but should thin.",
+        "nb": "I regionen rundt {place} er snødekket solid, omtrent {n} cm, men det blir tynnere.",
+        "sv": "I regionen runt {place} är snötäcket rejält, ungefär {n} cm, men det tunnar ut.",
+        "de": "In der weiteren Region um {place} liegt etwa {n} cm Schnee, aber er wird dünner.",
+        "fr": "Dans la région autour de {place}, manteau continu d'environ {n} cm, mais il devrait s'amincir.",
+        "es": "En la región alrededor de {place} la nieve continua promedia {n} cm, pero debería adelgazar.",
+        "it": "Nella regione intorno a {place} il manto continuo è di circa {n} cm, ma dovrebbe assottigliarsi.",
+        "pt-BR": "Na região ao redor de {place} a neve contínua média é de {n} cm, mas deve afinar.",
+        "ja": "{place}周辺の広い地域では、厚い積雪は平均約{n}cmですが、薄くなる見込みです。",
+        "zh-Hans": "在{place}周边的更大范围内，较厚积雪平均约{n}厘米，但预计会变薄。",
     },
 }
 
@@ -448,7 +523,8 @@ def rule_text(cell: CellStats, lang: str) -> str:
         number = max(shown_cm(cell.mean_cm), 1 if "{n}" in _RULES[kind][lang] else 0)
     template = _RULES[kind][lang]
     text = template.replace("{n}", str(number))
-    cleaned = validate_sentence(text, lang)
+    english = None if lang == "en" else _RULES[kind]["en"].replace("{n}", str(number))
+    cleaned = accept_sentence(text, lang, english)
     if cleaned is None:
         fallback = validate_sentence(SAFE_SENTENCE, "en")
         if fallback is None:
@@ -473,13 +549,14 @@ def system_prompt() -> str:
         + ", ".join(f'"{lang}":"..."' for lang in LANGUAGES)
         + "}}]}. "
         f"Use exactly these language keys: {langs}. "
-        "One factual sentence per language about snow on the ground. "
+        "One factual sentence per language about snow on the ground in the wider region, "
+        "not at a single point. A cell is hundreds of kilometres across. "
         f"At most {MAX_WORDS} words in languages that use spaces, "
-        f"and at most 40 characters in ja and zh-Hans. "
-        "No emoji, URLs, HTML, markdown, city names, country names, or people. "
+        f"and at most {MAX_CJK_CHARS} characters in ja and zh-Hans. "
+        "No emoji, URLs, domains, phone numbers, HTML, markdown, city names, or people. "
         "Do not invent temperature, rain, wind, or history. "
-        f"You may include the token {PLACEHOLDER} at most once. "
-        "The sentence must stay factual if that token is deleted. "
+        f"Include the token {PLACEHOLDER} exactly once, inside wording such as "
+        "'Around {place} and the wider region' or the equivalent in that language. "
         "Depths are centimetres, averaged over the whole cell. "
         "snow_cover_pct is the share of the cell deeper than 1 cm. "
         "in_7_days_mean_cm is the average at the end of the forecast week."
@@ -575,35 +652,109 @@ def load_config(env: Mapping[str, str] | None = None) -> AIConfig:
     return AIConfig(key, base, model, max_calls, True, "ok")
 
 
-class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        raise urllib.error.HTTPError(req.full_url, code, "redirect blocked", headers, fp)
+def _close_socket(sock) -> None:
+    if sock is None:
+        return
+    try:
+        sock.shutdown(socket.SHUT_RDWR)
+    except OSError:
+        pass
+    try:
+        sock.close()
+    except OSError:
+        pass
+
+
+def _abort_connection(conn: http.client.HTTPConnection, response=None, sockets=()) -> None:
+    """Close every socket the call is using so a slow drip cannot outlive the deadline.
+
+    ``getresponse`` may hand the socket to the response object. Closing only
+    ``conn.sock`` then does nothing, and the read keeps going.
+    """
+    for sock in sockets:
+        _close_socket(sock)
+    _close_socket(getattr(conn, "sock", None))
+    if response is not None:
+        try:
+            response.close()
+        except Exception:
+            pass
+        _close_socket(getattr(getattr(response, "fp", None), "raw", None))
+    try:
+        conn.close()
+    except OSError:
+        pass
 
 
 def post_chat(url: str, key: str, model: str, messages: list[dict[str, str]], timeout: float) -> dict:
-    payload = {
+    """POST one chat completion. ``timeout`` is a wall-clock limit for the whole call.
+
+    Redirects are not followed. The key is sent only in the Authorization header.
+    """
+    if timeout <= 0:
+        raise TimeoutError("wall-clock budget exhausted")
+    parts = urllib.parse.urlsplit(url)
+    if parts.query or parts.fragment or parts.username or parts.password:
+        raise ValueError("URL must not carry a query, fragment, or userinfo")
+    path = parts.path or "/"
+    if parts.scheme == "https":
+        conn: http.client.HTTPConnection = http.client.HTTPSConnection(
+            parts.hostname, parts.port or 443, timeout=timeout)
+    elif parts.scheme == "http" and parts.hostname in {"127.0.0.1", "localhost"}:
+        conn = http.client.HTTPConnection(parts.hostname, parts.port or 80, timeout=timeout)
+    else:
+        raise ValueError("only https URLs are allowed")
+    body = json.dumps({
         "model": model,
         "temperature": 0.2,
         "max_tokens": MAX_TOKENS,
         "messages": messages,
+    }).encode("utf-8")
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "Authorization": f"Bearer {key}",
+        "User-Agent": USER_AGENT,
+        "Content-Length": str(len(body)),
     }
-    request = urllib.request.Request(
-        url,
-        data=json.dumps(payload).encode("utf-8"),
-        method="POST",
-        headers={
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-            "Authorization": f"Bearer {key}",
-            "User-Agent": USER_AGENT,
-        },
-    )
-    opener = urllib.request.build_opener(_NoRedirect)
-    with opener.open(request, timeout=timeout) as response:
-        if getattr(response, "status", 200) != 200:
-            raise urllib.error.HTTPError(
-                url, response.status, "unexpected status", response.headers, response)
+    fired = False
+    sockets: list = []
+    response_box: dict = {}
+
+    def _on_deadline() -> None:
+        nonlocal fired
+        fired = True
+        _abort_connection(conn, response_box.get("response"), sockets)
+
+    timer = threading.Timer(timeout, _on_deadline)
+    timer.daemon = True
+    timer.start()
+    try:
+        conn.connect()
+        if conn.sock is not None:
+            sockets.append(conn.sock)
+        if fired:
+            raise TimeoutError("wall-clock timeout")
+        conn.request("POST", path, body=body, headers=headers)
+        response = conn.getresponse()
+        response_box["response"] = response
+        if conn.sock is not None and conn.sock not in sockets:
+            sockets.append(conn.sock)
+        status = response.status
+        if 300 <= status < 400:
+            raise urllib.error.HTTPError(url, status, "redirect blocked", response.msg, None)
+        if status != 200:
+            raise urllib.error.HTTPError(url, status, "unexpected status", response.msg, None)
         raw = response.read(MAX_RESPONSE_BYTES + 1)
+    except Exception as error:
+        if fired:
+            raise TimeoutError("wall-clock timeout") from error
+        raise
+    finally:
+        timer.cancel()
+        conn.close()
+    if fired:
+        raise TimeoutError("wall-clock timeout")
     if len(raw) > MAX_RESPONSE_BYTES:
         raise ValueError("response too large")
     return json.loads(raw.decode("utf-8"))
@@ -662,35 +813,49 @@ def apply_ai(
     url = chat_url(config.base_url)
     batches = [chosen[i:i + BATCH_SIZE] for i in range(0, len(chosen), BATCH_SIZE)]
     for batch in batches:
-        if calls >= config.max_calls or time.monotonic() >= deadline:
+        if calls >= config.max_calls:
+            break
+        remaining = deadline - time.monotonic()
+        if remaining < 1:
+            print("  sentences: AI budget reached; remaining cells stay on rules")
             break
         calls += 1
         wanted = {cell.id: cell for cell in batch}
+        call_timeout = min(float(REQUEST_TIMEOUT_S), remaining)
         try:
             payload = transport(
-                url, config.api_key, config.model, messages_for(batch), REQUEST_TIMEOUT_S)
+                url, config.api_key, config.model, messages_for(batch), call_timeout)
+            content, finish = _message_text(payload) if isinstance(payload, dict) else (None, None)
+            if content is None or (finish or "").lower() == "length":
+                print("  sentences: AI reply was empty or cut off; batch stays on rules")
+                continue
+            parsed = parse_sentences(content)
         except urllib.error.HTTPError as error:
+            # Status only. The body and the exception text can echo the request.
             print(f"  sentences: AI call failed (HTTP {error.code})")
             continue
-        except Exception as error:  # noqa: BLE001 — one bad call must not stop the build
+        except Exception as error:  # noqa: BLE001 — one bad call must not drop earlier lines
             print(f"  sentences: AI call failed ({type(error).__name__})")
             continue
-        content, finish = _message_text(payload) if isinstance(payload, dict) else (None, None)
-        if content is None or (finish or "").lower() == "length":
-            print("  sentences: AI reply was empty or cut off; batch stays on rules")
-            continue
-        parsed = parse_sentences(content)
-        for cell_id, cell in wanted.items():
+        for cell_id in wanted:
             raw = parsed.get(cell_id)
             if not isinstance(raw, dict):
                 continue
-            kept: dict[str, str] = {}
+            cleaned: dict[str, str] = {}
             for lang in LANGUAGES:
-                cleaned = validate_sentence(raw.get(lang), lang) if lang in raw else None
-                if cleaned is not None:
-                    kept[lang] = cleaned
+                if lang not in raw:
+                    continue
+                line = validate_sentence(raw.get(lang), lang)
+                if line is not None:
+                    cleaned[lang] = line
+            english = cleaned.get("en")
+            kept = {
+                lang: line
+                for lang, line in cleaned.items()
+                if script_ok(line, lang, None if lang == "en" else english)
+            }
             if kept:
-                accepted[(cell.i, cell.j)] = kept
+                accepted[(wanted[cell_id].i, wanted[cell_id].j)] = kept
     return accepted, calls
 
 
@@ -741,6 +906,94 @@ def build_document(
     }
 
 
+def write_rule_file(
+    path: Path,
+    today,
+    later,
+    *,
+    generated: str,
+    run: str,
+    first_date: str,
+    last_date: str,
+    env: Mapping[str, str] | None = None,
+    inputs_path: Path | None = None,
+) -> dict:
+    """Write rule sentences only. This never calls a model and never reads the API key."""
+    cells = summarize(today, later)
+    daily_cap = live_ai_daily_cap(env)
+    document = build_document(
+        cells,
+        generated=generated,
+        run=run,
+        first_date=first_date,
+        last_date=last_date,
+        model="rule-based",
+        ai_calls=0,
+        live_ai_daily_cap=daily_cap,
+    )
+    _atomic_write(path, document)
+    if inputs_path is not None:
+        _atomic_write(inputs_path, {
+            "generated": generated,
+            "run": run,
+            "first_date": first_date,
+            "last_date": last_date,
+            "live_ai_daily_cap": daily_cap,
+            "cells": [asdict(cell) for cell in cells],
+        })
+    print(f"  sentences: wrote {path.name}, model=rule-based")
+    return document
+
+
+def upgrade_file(
+    sentence_path: Path,
+    inputs_path: Path,
+    *,
+    env: Mapping[str, str] | None = None,
+    transport: Callable[..., dict] | None = None,
+) -> int:
+    """Fill AI lines into an existing rule file. Leave that file untouched on failure.
+
+    The wall-clock budget is ``AI_BUDGET_S`` inside this process. The workflow
+    also kills the step on its own short timeout, after the rule file exists.
+    """
+    if not sentence_path.is_file() or not inputs_path.is_file():
+        print("  sentences: rule file or inputs missing; nothing to upgrade")
+        return 0
+    try:
+        inputs = json.loads(inputs_path.read_text(encoding="utf-8"))
+        cells = [CellStats(**row) for row in inputs["cells"]]
+        config = load_config(env)
+        if not config.enabled:
+            print(f"  sentences: rule-based ({config.reason})")
+            return 0
+        host = urllib.parse.urlsplit(chat_url(config.base_url)).hostname
+        print(f"  sentences: model={config.model} host={host} max_calls={config.max_calls}")
+        chosen = select_for_ai(cells, config.max_calls * BATCH_SIZE)
+        # apply_ai catches per call, including a nested JSON RecursionError,
+        # and returns lines already accepted plus the real call count.
+        ai_text, calls = apply_ai(
+            chosen, config, transport or post_chat, time.monotonic() + AI_BUDGET_S)
+        model = config.model if any(ai_text.values()) else "rule-based"
+        document = build_document(
+            cells,
+            generated=inputs["generated"],
+            run=inputs["run"],
+            first_date=inputs["first_date"],
+            last_date=inputs["last_date"],
+            model=model,
+            ai_calls=calls,
+            ai_text=ai_text,
+            live_ai_daily_cap=int(inputs["live_ai_daily_cap"]),
+        )
+        _atomic_write(sentence_path, document)
+        ai_rows = sum(1 for row in document["cells"] if "ai" in row["source"].values())
+        print(f"  sentences: upgraded {sentence_path.name}, {ai_rows} cells with an AI line, {calls} calls, model={model}")
+    except Exception as error:  # noqa: BLE001 — the rule file from the image step stays
+        print(f"  sentences: upgrade failed ({type(error).__name__}); rule file kept")
+    return 0
+
+
 def write_sentences(
     path: Path,
     today,
@@ -753,42 +1006,36 @@ def write_sentences(
     env: Mapping[str, str] | None = None,
     transport: Callable[..., dict] | None = None,
 ) -> dict:
-    """Write ``ai_sentences.json``. Always returns a full rule document on AI failure."""
-    cells = summarize(today, later)
-    config = load_config(env)
-    daily_cap = live_ai_daily_cap(env)
-    ai_text: dict[tuple[int, int], dict[str, str]] = {}
-    calls = 0
-    model = "rule-based"
-    if not config.enabled:
-        print(f"  sentences: rule-based ({config.reason})")
-    else:
-        host = urllib.parse.urlsplit(chat_url(config.base_url)).hostname
-        print(f"  sentences: model={config.model} host={host} max_calls={config.max_calls}")
-        chosen = select_for_ai(cells, config.max_calls * BATCH_SIZE)
-        caller = transport or post_chat
-        try:
-            ai_text, calls = apply_ai(chosen, config, caller, time.monotonic() + AI_BUDGET_S)
-        except Exception as error:  # noqa: BLE001
-            print(f"  sentences: AI step failed ({type(error).__name__}); rules only")
-            ai_text, calls = {}, 0
-        if any(ai_text.values()):
-            model = config.model
-    document = build_document(
-        cells,
-        generated=generated,
-        run=run,
-        first_date=first_date,
-        last_date=last_date,
-        model=model,
-        ai_calls=calls,
-        ai_text=ai_text,
-        live_ai_daily_cap=daily_cap,
+    """Write rules, then upgrade in-process. Tests use this. The workflow does not."""
+    document = write_rule_file(
+        path, today, later,
+        generated=generated, run=run, first_date=first_date, last_date=last_date, env=env,
     )
-    _atomic_write(path, document)
-    ai_rows = sum(1 for row in document["cells"] if "ai" in row["source"].values())
-    print(f"  sentences: wrote {path.name}, {ai_rows} cells with an AI line, {calls} calls, model={model}")
-    return document
+    if not load_config(env).enabled:
+        return document
+    inputs = path.with_name(path.name + ".inputs.json")
+    try:
+        write_rule_file(
+            path, today, later,
+            generated=generated, run=run, first_date=first_date, last_date=last_date,
+            env=env, inputs_path=inputs,
+        )
+        upgrade_file(path, inputs, env=env, transport=transport)
+        return json.loads(path.read_text(encoding="utf-8"))
+    finally:
+        inputs.unlink(missing_ok=True)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--sentences", default="site/snow/ai_sentences.json")
+    parser.add_argument("--inputs", default="build/sentence_inputs.json")
+    args = parser.parse_args(argv)
+    return upgrade_file(Path(args.sentences), Path(args.inputs))
+
+
+if __name__ == "__main__":
+    sys.exit(main())
 
 
 def _atomic_write(path: Path, document: dict) -> None:

@@ -199,6 +199,35 @@ Korte snøsetninger til appen: <a href="snow/ai_sentences.json">ai_sentences.jso
 """
 
 
+def publish_sentences(
+    snow_dir: Path,
+    today,
+    later,
+    *,
+    generated: str,
+    run: str,
+    first_date: str,
+    last_date: str,
+    inputs_path: Path,
+) -> None:
+    """Write the rule file. Exceptions stay here so the image publish continues."""
+    try:
+        import snow_sentences
+        snow_sentences.write_rule_file(
+            snow_dir / "ai_sentences.json",
+            today,
+            later,
+            generated=generated,
+            run=run,
+            first_date=first_date,
+            last_date=last_date,
+            inputs_path=inputs_path,
+        )
+    except Exception as error:  # noqa: BLE001
+        print(f"Snow sentences skipped ({type(error).__name__}). "
+              "Images and latest.json are ready.")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", default="site", help="output folder")
@@ -244,21 +273,18 @@ def main() -> int:
     }
     (snow_dir / "latest.json").write_text(json.dumps(manifest, indent=2) + "\n")
 
-    # Sentences are additive. A failure here must not throw away the images.
-    try:
-        import snow_sentences
-        snow_sentences.write_sentences(
-            snow_dir / "ai_sentences.json",
-            today_depth,
-            later_depth,
-            generated=manifest["generated"],
-            run=run_id,
-            first_date=days[0]["date"],
-            last_date=days[-1]["date"],
-        )
-    except Exception as error:  # noqa: BLE001
-        print(f"Snow sentences skipped ({type(error).__name__}). "
-              "Images and latest.json are ready.")
+    # Rule sentences only. The model step is a later workflow step, so a hung
+    # call cannot stop these images or latest.json from being published.
+    publish_sentences(
+        snow_dir,
+        today_depth,
+        later_depth,
+        generated=manifest["generated"],
+        run=run_id,
+        first_date=days[0]["date"],
+        last_date=days[-1]["date"],
+        inputs_path=Path("build") / "sentence_inputs.json",
+    )
 
     figures = "".join(
         f'<figure><img src="snow/{day["file"]}" alt="Snø {day["date"]}">'

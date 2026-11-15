@@ -97,9 +97,14 @@ class RuleAndValidationTest(unittest.TestCase):
             for lang in snow.LANGUAGES:
                 text = snow.rule_text(item, lang)
                 self.assertEqual(snow.validate_sentence(text, lang), text)
+                english = snow.rule_text(item, "en")
+                self.assertEqual(snow.accept_sentence(text, lang, None if lang == "en" else english), text)
+                self.assertIn("{place}", text)
                 self.assertNotIn("http", text.lower())
                 self.assertNotIn("<", text)
                 self.assertNotIn("{n}", text)
+                if lang != "en":
+                    self.assertNotEqual(text, english)
 
     def test_kind_thresholds(self):
         self.assertEqual(snow.kind_of(cell()), "none")
@@ -113,21 +118,34 @@ class RuleAndValidationTest(unittest.TestCase):
         self.assertEqual(snow.kind_of(cell(mean_cm=25, max_cm=40, fraction=0.8, later_mean_cm=8)), "solid_down")
 
     def test_rejects_unsafe_text(self):
-        good = "Patchy snow in this area, about 4 cm on average."
+        good = "Around {place} and the wider region, snow is patchy, about 4 cm."
         self.assertEqual(snow.validate_sentence(good, "en"), good)
-        self.assertIsNone(snow.validate_sentence("See https://evil.example/snow", "en"))
-        self.assertIsNone(snow.validate_sentence("See www.evil.example for snow", "en"))
-        self.assertIsNone(snow.validate_sentence("Snow <b>cover</b> is solid here.", "en"))
-        self.assertIsNone(snow.validate_sentence("Snow cover is solid. More is due.", "en"))
-        self.assertIsNone(snow.validate_sentence("Snow around {place} and {place}.", "en"))
-        self.assertIsNone(snow.validate_sentence("Snow {place} {town} today here.", "en"))
-        self.assertIsNone(snow.validate_sentence("Snow 😀 is solid in this area today.", "en"))
-        self.assertIsNone(snow.validate_sentence("x" * 181, "en"))
-        self.assertIsNone(snow.validate_sentence("Too short.", "en"))
-        self.assertIsNone(snow.validate_sentence("one two", "en"))
-        long = " ".join(["snow"] * 19)
-        self.assertIsNone(snow.validate_sentence(long, "en"))
-        self.assertIsNone(snow.validate_sentence("この地域の雪" * 20, "ja"))
+        # A bare domain has no "http" substring; the check is not a prefix search.
+        self.assertNotIn("http", "Around {place} and the wider region, see evil-example.com today.")
+        self.assertIsNone(snow.validate_sentence(
+            "Around {place} and the wider region, see evil-example.com today.", "en"))
+        self.assertIsNone(snow.validate_sentence(
+            "Around {place} and the wider region, see https://evil.example/snow today.", "en"))
+        self.assertIsNone(snow.validate_sentence(
+            "Around {place} and the wider region, see www.evil.example today.", "en"))
+        self.assertIsNone(snow.validate_sentence(
+            "Around {place} and the wider region, call 90012345 now.", "en"))
+        self.assertIsNone(snow.validate_sentence(
+            "Around {place} and the wider region, call +47 900 12 345 now.", "en"))
+        self.assertIsNone(snow.validate_sentence(
+            "Around {place} and the wider region, snow is _solid_ today.", "en"))
+        self.assertIsNone(snow.validate_sentence(
+            "Around {place} and the wider region, snow is __solid__ today.", "en"))
+        self.assertIsNone(snow.validate_sentence(
+            "Around {place} and the wider region, see javascript:alert(1) now.", "en"))
+        self.assertIsNone(snow.validate_sentence("Snow <b>cover</b> is solid around {place}.", "en"))
+        self.assertIsNone(snow.validate_sentence("Around {place} and the wider region, snow is solid. More is due.", "en"))
+        self.assertIsNone(snow.validate_sentence("Snow around {place} and {place} in the wider region.", "en"))
+        self.assertIsNone(snow.accept_sentence(
+            "Around {place} and the wider region, snow is solid today.", "ja", None))
+        self.assertIsNone(snow.accept_sentence(good, "nb", good))
+        self.assertIsNone(snow.accept_sentence(
+            "{place}周辺だけの短い文です。", "en", None))
 
     def test_allows_one_place_token(self):
         text = "Snow cover around {place} is solid, about 12 cm."
@@ -313,12 +331,10 @@ class AICallTest(unittest.TestCase):
             for line in messages[1]["content"].splitlines():
                 if line.startswith("id="):
                     batch_ids.append(line.split()[0].split("=", 1)[1])
-            sentences = {
-                lang: "Solid snow cover in this area, about 12 cm."
-                for lang in snow.LANGUAGES
-            }
+            sample = cell(mean_cm=20, max_cm=40, fraction=0.8, later_mean_cm=20)
+            sentences = {lang: snow.rule_text(sample, lang) for lang in snow.LANGUAGES}
             # One language is unsafe and must fall back on its own.
-            sentences["nb"] = "Se https://example.com nå med en gang."
+            sentences["nb"] = "I regionen rundt {place} se evil-example.com i dag."
             return {"choices": [{"finish_reason": "stop", "message": {"content": json.dumps({
                 "cells": [{"id": cell_id, "sentences": sentences} for cell_id in batch_ids]
             })}}]}
@@ -386,48 +402,128 @@ class AICallTest(unittest.TestCase):
         self.assertEqual(calls, 1)
 
     def test_post_chat_puts_the_key_in_the_header_only(self):
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        import threading
         captured = {}
 
-        class Response:
-            status = 200
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length", "0"))
+                captured["body"] = self.rfile.read(length)
+                captured["auth"] = self.headers.get("Authorization")
+                captured["path"] = self.path
+                payload = b'{"choices":[]}'
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
 
-            def read(self, _n):
-                return b'{"choices":[]}'
+            def log_message(self, *_args):
+                return
 
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *_args):
-                return False
-
-        class Opener:
-            def open(self, request, timeout):
-                captured["url"] = request.full_url
-                captured["timeout"] = timeout
-                captured["auth"] = request.get_header("Authorization")
-                captured["body"] = request.data
-                return Response()
-
-        with mock.patch("snow_sentences.urllib.request.build_opener", return_value=Opener()):
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            port = server.server_address[1]
             snow.post_chat(
-                "https://api.example.test/v1/chat/completions",
+                f"http://127.0.0.1:{port}/v1/chat/completions",
                 "unit-test-key",
                 "demo",
                 [{"role": "user", "content": "hi"}],
                 5,
             )
-        self.assertNotIn("unit-test-key", captured["url"])
+        finally:
+            server.shutdown()
+        self.assertEqual(captured["path"], "/v1/chat/completions")
+        self.assertNotIn("unit-test-key", captured["path"])
         self.assertEqual(captured["auth"], "Bearer unit-test-key")
-        self.assertEqual(captured["timeout"], 5)
         body = json.loads(captured["body"])
         self.assertEqual(body["model"], "demo")
         self.assertEqual(body["max_tokens"], snow.MAX_TOKENS)
         self.assertNotIn("unit-test-key", captured["body"].decode())
 
-    def test_redirect_is_blocked(self):
-        handler = snow._NoRedirect()
-        with self.assertRaises(urllib.error.HTTPError):
-            handler.redirect_request(mock.Mock(full_url="https://api.example.test/v1"), None, 302, "found", None, "https://elsewhere.test")
+    def test_redirect_is_not_followed(self):
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        import threading
+        landed = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                if self.path.startswith("/landed"):
+                    landed.append(self.path)
+                    payload = b'{"choices":[]}'
+                    self.send_response(200)
+                    self.send_header("Content-Length", str(len(payload)))
+                    self.end_headers()
+                    self.wfile.write(payload)
+                    return
+                self.send_response(302)
+                port = self.server.server_address[1]
+                self.send_header("Location", f"http://127.0.0.1:{port}/landed")
+                self.end_headers()
+
+            def log_message(self, *_args):
+                return
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            port = server.server_address[1]
+            with self.assertRaises(urllib.error.HTTPError) as caught:
+                snow.post_chat(
+                    f"http://127.0.0.1:{port}/v1/chat/completions",
+                    "unit-test-key",
+                    "demo",
+                    [{"role": "user", "content": "hi"}],
+                    5,
+                )
+        finally:
+            server.shutdown()
+        self.assertEqual(caught.exception.code, 302)
+        self.assertEqual(landed, [])
+
+    def test_drip_cannot_outlive_the_wall_clock(self):
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        import threading
+        import time
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", "8000")
+                self.end_headers()
+                try:
+                    for _ in range(40):
+                        time.sleep(0.25)
+                        self.wfile.write(b"x")
+                        self.wfile.flush()
+                except Exception:
+                    return
+
+            def log_message(self, *_args):
+                return
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        started = time.monotonic()
+        try:
+            port = server.server_address[1]
+            with self.assertRaises(TimeoutError):
+                snow.post_chat(
+                    f"http://127.0.0.1:{port}/v1/chat/completions",
+                    "unit-test-key",
+                    "demo",
+                    [{"role": "user", "content": "hi"}],
+                    0.4,
+                )
+        finally:
+            server.shutdown()
+        self.assertLess(time.monotonic() - started, 2.0)
 
     def test_call_cap_cannot_exceed_the_hard_limit(self):
         config = snow.load_config({
@@ -437,6 +533,91 @@ class AICallTest(unittest.TestCase):
             "SNOWMAP_AI_MAX_CALLS": "999",
         })
         self.assertEqual(config.max_calls, snow.HARD_MAX_CALLS)
+        seventeen = snow.load_config({
+            "SNOWMAP_AI_API_KEY": "unit-test-key",
+            "SNOWMAP_AI_BASE_URL": "https://api.example.test/v1",
+            "SNOWMAP_AI_MODEL": "demo",
+            "SNOWMAP_AI_MAX_CALLS": "17",
+        })
+        self.assertEqual(seventeen.max_calls, 16)
+        self.assertNotEqual(seventeen.max_calls, 17)
+
+    def test_seventeenth_call_is_not_started(self):
+        config = snow.load_config({
+            "SNOWMAP_AI_API_KEY": "unit-test-key",
+            "SNOWMAP_AI_BASE_URL": "https://api.example.test/v1",
+            "SNOWMAP_AI_MODEL": "demo",
+            "SNOWMAP_AI_MAX_CALLS": "17",
+        })
+        started = []
+
+        def transport(*_args):
+            started.append(1)
+            return {"choices": [{"finish_reason": "stop", "message": {"content": "{}"}}]}
+
+        cells = [
+            cell(i=n // snow.N_LON, j=n % snow.N_LON, mean_cm=12, max_cm=20, fraction=0.4, later_mean_cm=20)
+            for n in range(17 * snow.BATCH_SIZE)
+        ]
+        _accepted, calls = snow.apply_ai(cells, config, transport, snow.time.monotonic() + 30)
+        self.assertEqual(calls, 16)
+        self.assertEqual(len(started), 16)
+
+    def test_generic_exception_does_not_log_the_key(self):
+        secret = "unit-test-key-not-a-real-secret"
+        config = snow.load_config({
+            "SNOWMAP_AI_API_KEY": secret,
+            "SNOWMAP_AI_BASE_URL": "https://api.example.test/v1",
+            "SNOWMAP_AI_MODEL": "demo",
+        })
+
+        def transport(*_args):
+            raise RuntimeError(f"provider failed with key {secret}")
+
+        buffer = io.StringIO()
+        with mock.patch("sys.stdout", buffer):
+            accepted, calls = snow.apply_ai(
+                [cell(mean_cm=12, max_cm=20, fraction=0.5, later_mean_cm=12)],
+                config, transport, snow.time.monotonic() + 5)
+        self.assertNotIn(secret, buffer.getvalue())
+        self.assertIn("RuntimeError", buffer.getvalue())
+        self.assertEqual(accepted, {})
+        self.assertEqual(calls, 1)
+
+    def test_nested_json_keeps_earlier_lines_and_the_call_count(self):
+        config = snow.load_config({
+            "SNOWMAP_AI_API_KEY": "unit-test-key",
+            "SNOWMAP_AI_BASE_URL": "https://api.example.test/v1",
+            "SNOWMAP_AI_MODEL": "demo",
+        })
+        sample = cell(mean_cm=20, max_cm=40, fraction=0.8, later_mean_cm=20)
+        good = {lang: snow.rule_text(sample, lang) for lang in snow.LANGUAGES}
+        nested = '{"a":' * 10000 + "1" + "}" * 10000
+        started = []
+
+        def transport(_url, _key, _model, messages, _timeout):
+            started.append(1)
+            if len(started) > 1:
+                return {"choices": [{"finish_reason": "stop", "message": {"content": nested}}]}
+            ids = []
+            for line in messages[1]["content"].splitlines():
+                if line.startswith("id="):
+                    ids.append(line.split()[0].split("=", 1)[1])
+            return {"choices": [{"finish_reason": "stop", "message": {"content": json.dumps({
+                "cells": [{"id": cell_id, "sentences": good} for cell_id in ids]
+            })}}]}
+
+        cells = [
+            cell(i=n // snow.N_LON, j=n % snow.N_LON, mean_cm=12, max_cm=30, fraction=0.4, later_mean_cm=20)
+            for n in range(snow.BATCH_SIZE * 2)
+        ]
+        buffer = io.StringIO()
+        with mock.patch("sys.stdout", buffer):
+            accepted, calls = snow.apply_ai(cells, config, transport, snow.time.monotonic() + 30)
+        self.assertEqual(calls, 2)
+        self.assertEqual(len(accepted), snow.BATCH_SIZE)
+        self.assertIn("RecursionError", buffer.getvalue())
+        self.assertNotIn("unit-test-key", buffer.getvalue())
 
 
 def _numpy_installed() -> bool:
@@ -524,6 +705,54 @@ class PromptBudgetTest(unittest.TestCase):
         self.assertNotIn("latitude", blob.lower())
         self.assertNotIn("longitude", blob.lower())
         self.assertLess(len(messages[0]["content"]), 2500)
+        self.assertIn(f"at most {snow.MAX_CJK_CHARS} characters", messages[0]["content"])
+        self.assertNotIn("40 characters", messages[0]["content"])
+        self.assertIn("wider region", messages[0]["content"])
+
+
+class PublishGuardTest(unittest.TestCase):
+    def test_sentence_failure_does_not_escape(self):
+        import importlib
+        import sys
+        import types
+        for name in ("eccodes", "numpy", "PIL", "requests"):
+            if name in sys.modules:
+                continue
+            try:
+                importlib.import_module(name)
+            except ModuleNotFoundError:
+                module = types.ModuleType(name)
+                if name == "requests":
+                    class _Session:
+                        def __init__(self):
+                            self.headers = {}
+                    module.Session = _Session
+                if name == "PIL":
+                    module.Image = object
+                sys.modules[name] = module
+        import build_snow
+        with mock.patch("snow_sentences.write_rule_file", side_effect=RuntimeError("disk")):
+            build_snow.publish_sentences(
+                Path("/tmp"), None, None,
+                generated="2026-11-15T00:00:00Z",
+                run="2026111500",
+                first_date="2026-11-15",
+                last_date="2026-11-22",
+                inputs_path=Path("/tmp/snow-sentence-inputs.json"),
+            )
+
+    def test_failed_upgrade_keeps_the_rule_file(self):
+        target = Path(os.environ.get("TMPDIR", "/tmp")) / "ai_sentences_keep.json"
+        inputs = Path(os.environ.get("TMPDIR", "/tmp")) / "sentence_inputs_bad.json"
+        try:
+            target.write_text('{"schema_version":1,"kept":true}\n', encoding="utf-8")
+            inputs.write_text("not json", encoding="utf-8")
+            code = snow.upgrade_file(target, inputs, env={})
+            self.assertEqual(code, 0)
+            self.assertEqual(target.read_text(encoding="utf-8"), '{"schema_version":1,"kept":true}\n')
+        finally:
+            target.unlink(missing_ok=True)
+            inputs.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":

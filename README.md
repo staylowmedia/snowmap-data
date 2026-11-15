@@ -12,9 +12,10 @@ legger over kartet.
 3. Hver dag blir et gjennomsiktig PNG-bilde i Web Mercator, 2048 × 2048
    piksler, der hvitt betyr snø på bakken.
 4. Bildene og `snow/latest.json` publiseres på GitHub Pages.
-5. Samme kjøring skriver `snow/ai_sentences.json`: én kort snøsetning per
-   5°-rute og språk. Uten API-nøkkel blir alle setninger regeltekst.
-   Feiler AI-steget, publiseres bildene og `latest.json` likevel.
+5. Samme kjøring skriver `snow/ai_sentences.json` med regeltekst. Et eget
+   steg etterpå kan fylle inn modellsetninger. Det steget har et kort
+   tidsavbrudd og `continue-on-error`. Dør det, publiseres bildene,
+   `latest.json` og regelfilen likevel.
 
 ## Filer appen bruker
 
@@ -25,8 +26,11 @@ legger over kartet.
 ## Snøsetninger
 
 Filen ligger ved siden av `latest.json` og bruker samme `generated` og `run`.
-Setningen beskriver snødybde i en 5°-rute, ikke et punkt, og den inneholder
-ikke stedsnavn. Appen kan bytte ut `{place}` med stedsnavnet selv.
+Setningen beskriver snødybde i en 5°-rute (omtrent 555 km), ikke et punkt.
+Hver setning sier det eksplisitt, for eksempel «Around {place} and the wider
+region …» eller «I regionen rundt {place} …». Appen bytter bare ut `{place}`
+med stedsnavnet og lar region-ordene stå. Uten navn kan `{place}` byttes ut
+med «området» / «the area», ikke slettes alene.
 
 Eksempel, forkortet (filen har alle 2592 rutene, ti språk i hver):
 
@@ -64,7 +68,7 @@ Ukjente felt skal ignoreres. `schema_version` er 1.
 | `generated`, `run` | Samme strenger som i `latest.json` fra samme kjøring. |
 | `model` | Modell-id når minst én setning ble godkjent, ellers `"rule-based"`. |
 | `languages` | Kodene appen bruker: `en`, `nb`, `sv`, `de`, `fr`, `es`, `it`, `pt-BR`, `ja`, `zh-Hans`. |
-| `placeholder` | Alltid `{place}`. Regelteksten i denne versjonen bruker den ikke. |
+| `placeholder` | Alltid `{place}`. Hver setning inneholder tokenet nøyaktig én gang, inne i en formulering om den videre regionen. |
 | `max_age_hours` | 30. Appen bruker tallet i ferskhetsregelen under. |
 | `app_config.live_ai_daily_cap` | Heltall ≥ 0. Tak for **brukerutløste** direkte modellkall per enhet per lokal dag. Forhåndsberegnede setninger teller ikke. Standard 5. |
 | `window` | Datoene setningen gjelder, lik første og siste dato i `latest.json`. |
@@ -108,10 +112,16 @@ alle 0,25°-punktene i ruten, også hav. Setningen gjelder `window.first_date`
 minst 5 cm innen `window.last_date`. Det er én setning for hele vinduet,
 ikke én per dag. Temperatur, nedbør og tiårshistorikk er ikke med.
 
-`{place}` kan stå høyst én gang. Appen bytter den ut med stedsnavnet som
-ren tekst. Uten navn fjernes tokenet og doble mellomrom slås sammen.
-Mer enn ett punktum, URL, HTML, markdown eller emoji blir forkastet før
-publisering, og den språklinjen faller tilbake til regelen.
+`{place}` står nøyaktig én gang. Appen bytter den ut med stedsnavnet som
+ren tekst og beholder ordene om den videre regionen. Uten navn byttes tokenet
+ut med et generelt ord («området» / «the area»), det slettes ikke alene.
+Før publisering forkastes en linje som har mer enn ett punktum, en URL, et
+bart domenenavn (`evil-example.com`), et telefonnummer (seks siffer på rad,
+eller siffer gruppert som et nummer), et skjema (`javascript:`, `https:`),
+markdown (`_`, `*`, `` ` ``), HTML eller emoji. Japansk og kinesisk må
+inneholde CJK, og høyst 90 tegn, samme tall som i prompten. En ikke-engelsk
+linje som er identisk med den engelske, eller en latinsk linje som mest
+består av et annet skriftsystem, faller tilbake til regelen.
 
 ### Når appen skal bruke filen
 
@@ -145,9 +155,12 @@ eller loggen.
 | `SNOWMAP_AI_MAX_CALLS` | Actions-variabel | Valgfri. Standard og hardt tak 16. `0` gir bare regler. |
 | `SNOWMAP_LIVE_AI_DAILY_CAP` | Actions-variabel | Valgfri. Overstyrer 5. Se over. |
 
-Hvert kall tar inntil 8 ruter og alle ti språk, med 12 sekunders tidsavbrudd
-og 60 sekunders tak for hele AI-steget. Manglende nøkkel, HTTP-feil, avkuttet
-svar eller en setning som ikke består sjekken, gir regeltekst for den linjen.
+Hvert kall tar inntil 8 ruter og alle ti språk. 12 sekunder og 60 sekunder er
+veggtid, ikke tid mellom byte: en treg svarstrøm blir avbrutt. Workflow-steget
+har i tillegg `timeout-minutes: 3` og `continue-on-error`. Nøkkelen ligger
+bare i det steget. Manglende nøkkel, HTTP-feil, avkuttet svar eller en setning
+som ikke består sjekken, gir regeltekst for den linjen. Testene kjører i en
+egen jobb og stopper ikke publiseringen.
 
 ## Kjøre lokalt
 
