@@ -70,15 +70,15 @@ Ukjente felt skal ignoreres. `schema_version` er 1.
 | `languages` | Kodene appen bruker: `en`, `nb`, `sv`, `de`, `fr`, `es`, `it`, `pt-BR`, `ja`, `zh-Hans`. |
 | `placeholder` | Alltid `{place}`. Hver setning inneholder tokenet nøyaktig én gang, inne i en formulering om den videre regionen. |
 | `max_age_hours` | 30. Appen bruker tallet i ferskhetsregelen under. |
-| `app_config.live_ai_daily_cap` | Heltall ≥ 0. Tak for **brukerutløste** direkte modellkall per enhet per lokal dag. Forhåndsberegnede setninger teller ikke. Standard 5. |
+| `app_config.live_ai_daily_cap` | Heltall fra 0 til 20. Tak for **brukerutløste** direkte modellkall per enhet per lokal dag. Forhåndsberegnede setninger teller ikke. Standard 5. Verdier over 20 publiseres som 20. Under 0, eller ikke et heltall, publiseres som 5. |
 | `window` | Datoene setningen gjelder, lik første og siste dato i `latest.json`. |
 | `ai_calls` | Antall modellkall i kjøringen. Appen trenger det ikke. |
 | `cells` | 2592 objekter, radvis. `text` og `source` har alle språkene. `source` er `"ai"` eller `"rule"`. |
 
 `app_config` settes ett sted. Standarden er `LIVE_AI_DAILY_CAP` i
 `scripts/snow_sentences.py` (5). Actions-variabelen `SNOWMAP_LIVE_AI_DAILY_CAP`
-overstyrer den. Tom eller ugyldig verdi (ikke et heltall ≥ 0) gir 5, og
-jobben fortsetter. Mangler feltet, eller er filen uleselig, bruker appen 5.
+overstyrer den. Tom, negativ eller ugyldig verdi gir 5. Over 20 blir 20.
+Jobben fortsetter. Mangler feltet, eller er filen uleselig, bruker appen 5.
 Setningenes ferskhetsregler hever ikke taket.
 
 ### Rute
@@ -153,7 +153,7 @@ eller loggen.
 | `SNOWMAP_AI_BASE_URL` | Actions-variabel | Påkrevd. `https`, uten brukerinfo, spørrestreng eller fragment. `/chat/completions` legges til om den mangler. |
 | `SNOWMAP_AI_MODEL` | Actions-variabel | Påkrevd. For eksempel `gpt-4.1-mini`. |
 | `SNOWMAP_AI_MAX_CALLS` | Actions-variabel | Valgfri. Standard og hardt tak 16. `0` gir bare regler. |
-| `SNOWMAP_LIVE_AI_DAILY_CAP` | Actions-variabel | Valgfri. Overstyrer 5. Se over. |
+| `SNOWMAP_LIVE_AI_DAILY_CAP` | Actions-variabel | Valgfri. Heltall 0–20. Over 20 blir 20. Under 0 eller ugyldig blir 5. |
 
 Hvert kall tar inntil 8 ruter og alle ti språk. 12 sekunder og 60 sekunder er
 veggtid, ikke tid mellom byte: en treg svarstrøm blir avbrutt. Workflow-steget

@@ -169,11 +169,32 @@ class AppConfigTest(unittest.TestCase):
         self.assertEqual(snow.live_ai_daily_cap({}), 5)
         self.assertEqual(snow.live_ai_daily_cap({"SNOWMAP_LIVE_AI_DAILY_CAP": "12"}), 12)
         self.assertEqual(snow.live_ai_daily_cap({"SNOWMAP_LIVE_AI_DAILY_CAP": "0"}), 0)
+        self.assertEqual(snow.live_ai_daily_cap({"SNOWMAP_LIVE_AI_DAILY_CAP": "20"}), 20)
         buffer = io.StringIO()
         with mock.patch("sys.stdout", buffer):
             self.assertEqual(snow.live_ai_daily_cap({"SNOWMAP_LIVE_AI_DAILY_CAP": "nope"}), 5)
             self.assertEqual(snow.live_ai_daily_cap({"SNOWMAP_LIVE_AI_DAILY_CAP": "-3"}), 5)
-        self.assertNotIn("nope", buffer.getvalue())
+            self.assertEqual(snow.live_ai_daily_cap({"SNOWMAP_LIVE_AI_DAILY_CAP": "21"}), 20)
+            self.assertEqual(snow.live_ai_daily_cap({"SNOWMAP_LIVE_AI_DAILY_CAP": "100"}), 20)
+        logged = buffer.getvalue()
+        self.assertNotIn("nope", logged)
+        self.assertNotIn("100", logged)
+        self.assertIn("20", logged)
+
+    def test_published_cap_is_clamped_to_0_through_20(self):
+        cells = [cell(i=i, j=j) for i in range(snow.N_LAT) for j in range(snow.N_LON)]
+        document = snow.build_document(
+            cells, generated="2026-11-15T06:25:00Z", run="2026111500",
+            first_date="2026-11-15", last_date="2026-11-22", model="rule-based", ai_calls=0,
+            live_ai_daily_cap=99,
+        )
+        self.assertEqual(document["app_config"]["live_ai_daily_cap"], 20)
+        low = snow.build_document(
+            cells, generated="2026-11-15T06:25:00Z", run="2026111500",
+            first_date="2026-11-15", last_date="2026-11-22", model="rule-based", ai_calls=0,
+            live_ai_daily_cap=-4,
+        )
+        self.assertEqual(low["app_config"]["live_ai_daily_cap"], 5)
 
     def test_published_file_uses_the_env_value(self):
         cells = [cell(i=i, j=j) for i in range(snow.N_LAT) for j in range(snow.N_LON)]

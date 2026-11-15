@@ -45,7 +45,10 @@ TREND_CM = 5.0
 MAX_AGE_HOURS = 30
 # Single default for app_config.live_ai_daily_cap. The workflow can override
 # it with the SNOWMAP_LIVE_AI_DAILY_CAP variable; nothing else should hardcode it.
+# Published values are clamped to 0..LIVE_AI_DAILY_CAP_MAX. Above the max becomes
+# the max; below 0 or not an integer becomes the default.
 LIVE_AI_DAILY_CAP = 5
+LIVE_AI_DAILY_CAP_MAX = 20
 PLACEHOLDER = "{place}"
 
 BATCH_SIZE = 8
@@ -602,11 +605,24 @@ def chat_url(base: str) -> str:
     return trimmed + "/chat/completions"
 
 
+def clamp_live_ai_daily_cap(value: object) -> int:
+    """Value written to ``app_config.live_ai_daily_cap``. Always in 0..20.
+
+    Below 0, or anything that is not an integer, becomes the default (5).
+    Above 20 becomes 20.
+    """
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return LIVE_AI_DAILY_CAP
+    if value > LIVE_AI_DAILY_CAP_MAX:
+        return LIVE_AI_DAILY_CAP_MAX
+    return value
+
+
 def live_ai_daily_cap(env: Mapping[str, str] | None = None) -> int:
     """Cap the app should apply to explicit live AI calls on one device per day.
 
-    A blank value keeps the default. A value that is not an integer ≥ 0 also
-    keeps the default, so a typo still publishes a file the app can trust.
+    A blank, negative, or non-integer value publishes the default (5).
+    A value above 20 publishes 20.
     """
     source = os.environ if env is None else env
     raw = source.get("SNOWMAP_LIVE_AI_DAILY_CAP", "").strip()
@@ -615,10 +631,14 @@ def live_ai_daily_cap(env: Mapping[str, str] | None = None) -> int:
     try:
         value = int(raw)
     except ValueError:
-        value = -1
+        print("  sentences: SNOWMAP_LIVE_AI_DAILY_CAP ignored; using the default")
+        return LIVE_AI_DAILY_CAP
     if value < 0:
         print("  sentences: SNOWMAP_LIVE_AI_DAILY_CAP ignored; using the default")
         return LIVE_AI_DAILY_CAP
+    if value > LIVE_AI_DAILY_CAP_MAX:
+        print(f"  sentences: SNOWMAP_LIVE_AI_DAILY_CAP above {LIVE_AI_DAILY_CAP_MAX}; publishing {LIVE_AI_DAILY_CAP_MAX}")
+        return LIVE_AI_DAILY_CAP_MAX
     return value
 
 
@@ -891,7 +911,7 @@ def build_document(
         "languages": list(LANGUAGES),
         "placeholder": PLACEHOLDER,
         "max_age_hours": MAX_AGE_HOURS,
-        "app_config": {"live_ai_daily_cap": live_ai_daily_cap},
+        "app_config": {"live_ai_daily_cap": clamp_live_ai_daily_cap(live_ai_daily_cap)},
         "window": {"first_date": first_date, "last_date": last_date},
         "grid": {
             "resolution_deg": RESOLUTION_DEG,
